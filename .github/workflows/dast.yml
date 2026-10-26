@@ -7,7 +7,7 @@
 #               that mirrors the ALB ingress). ZAP imports the OpenAPI contract, crawls the
 #               dashboard, then runs a FULL scan (passive + active attacks), authenticated.
 #               Safe: synthetic data, thrown away when the job ends.          (blocking)
-#   stage       nightly, on demand, and before every promotion (promote.yml calls it): a
+#   stage       nightly and on demand (Run workflow, target "stage"), when you choose: a
 #               BASELINE scan (passive, read-only operations) of the deployed stage behind the
 #               real ALB/WAF. No attack payloads in a shared environment.   (blocking)
 #
@@ -43,11 +43,6 @@ on:
         type: choice
         options: [ephemeral, stage]
         default: ephemeral
-  workflow_call:          # promote.yml: scan stage before anything is copied to prod
-    inputs:
-      target:
-        type: string
-        default: stage
 
 permissions:
   contents: read
