@@ -1,0 +1,66 @@
+# Open a pull request with the GitOps change (new image tags) instead of pushing to main, which branch protection
+# reserves for pull requests. Merging the PR is the deployment: Argo CD syncs stage by itself after the merge;
+# production still waits for SYNC in Argo CD.
+#   - commits the staged changes on a new branch, pushes the branch, opens the PR (diff in the description)
+#   - the PR title carries [skip ci], so the merge commit on main starts no workflow run
+# Needs: permissions contents: write + pull-requests: write, and Settings > Actions > General >
+# "Allow GitHub Actions to create and approve pull requests".
+name: GitOps pull request
+description: Commit the staged GitOps change to a new branch and open a pull request for it
+inputs:
+  branch:
+    description: Name of the new branch (unique per run)
+    required: true
+  title:
+    description: PR title and commit message ([skip ci] is added)
+    required: true
+  next-step:
+    description: What happens after the merge (shown in the PR and the run summary)
+    required: true
+outputs:
+  url:
+    description: The pull request (empty when there was nothing to change)
+    value: ${{ steps.pr.outputs.url }}
+runs:
+  using: composite
+  steps:
+    - name: Open the pull request
+      id: pr
+      shell: bash
+      env:
+        BRANCH: ${{ inputs.branch }}
+        TITLE: ${{ inputs.title }} [skip ci]
+        NEXT: ${{ inputs.next-step }}
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        set -euo pipefail
+        git config user.name "github-actions[bot]"
+        git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+        if git diff --cached --quiet; then
+          echo "Nothing to change: no pull request." >> "$GITHUB_STEP_SUMMARY"; exit 0
+        fi
+        DIFF=$(git diff --cached)
+        git switch -c "$BRANCH"
+        git commit -m "$TITLE"
+        git push origin "$BRANCH"
+        BODY=$(printf '%s\n\n```diff\n%s\n```\n\nOpened by run %s/%s/actions/runs/%s. %s\n' \
+          "Image tags written by the pipeline. **Merging this pull request deploys it.**" "$DIFF" \
+          "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID" "$NEXT")
+        if ! gh pr create --base main --head "$BRANCH" --title "$TITLE" --body "$BODY" > pr.out 2> pr.err; then
+          cat pr.err
+          if grep -qi "not permitted to create" pr.err; then
+            echo "::error title=PR not allowed::GitHub Actions may not open pull requests in this repository. Settings > Actions > General > Workflow permissions: tick 'Allow GitHub Actions to create and approve pull requests', then re-run. The branch $BRANCH is already pushed: you can also open its PR by hand."
+          else
+            echo "::error::Could not open the pull request for $BRANCH (see above)"
+          fi
+          exit 1
+        fi
+        URL=$(tail -n 1 pr.out)
+        echo "url=$URL" >> "$GITHUB_OUTPUT"
+        echo "::notice title=Merge to deploy::$URL"
+        {
+          echo "### Pull request opened: merge it to deploy"
+          echo "$URL"
+          echo
+          echo "$NEXT"
+        } >> "$GITHUB_STEP_SUMMARY"

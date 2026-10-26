@@ -8,7 +8,8 @@
 #                   docker build -> Trivy (report only; blocks fixable CRITICAL when SECURITY_GATES = enforce) -> push to ECR
 #                   -> SBOM (CycloneDX, Syft) -> Cosign keyless signature
 #                   -> SBOM attestation -> SLSA build provenance (GitHub attestation)
-#   update-stage  writes the new tags into the stage values; Argo CD deploys stage
+#   update-stage  writes the new tags into the stage values and opens a PULL REQUEST (main is protected);
+#                 merging it deploys: Argo CD syncs stage
 #
 # In the cluster, Kyverno admits a CareSignal image ONLY if it was signed by this
 # workflow on main (platform/policies/verify-image-signatures.yaml). The Kyverno
@@ -277,12 +278,13 @@ jobs:
           push-to-registry: true
 
   update-stage:
-    name: Deploy to stage (GitOps commit)
+    name: Deploy to stage (GitOps pull request)
     needs: [changes, build]
     if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     permissions:
-      contents: write
+      contents: write        # push the gitops/stage-* branch
+      pull-requests: write   # open its pull request
     environment:
       name: stage
       url: https://caresignal-stage.${{ vars.DOMAIN_NAME || 'mfon21.space' }}
@@ -304,15 +306,11 @@ jobs:
           done
           git diff
           echo "TAG=$TAG" >> "$GITHUB_ENV"
-      - name: Commit and push
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add deploy/helm
-          if git diff --cached --quiet; then echo "Nothing to commit"; exit 0; fi
-          git commit -m "ci: deploy $TAG to stage [skip ci]"
-          for attempt in 1 2 3 4 5; do
-            git pull --rebase origin main && git push origin HEAD:main && break
-            sleep $((attempt * 5))
-          done
-          echo "Stage updated to \`$TAG\`; Argo CD syncs within about 3 minutes (Kyverno verifies the signatures)." >> "$GITHUB_STEP_SUMMARY"
+      - name: Stage the change
+        run: git add deploy/helm
+      # main is protected (pull requests only): the deployment is a pull request; merging it deploys stage
+      - uses: ./.github/actions/gitops-pr
+        with:
+          branch: gitops/stage-${{ env.TAG }}
+          title: "ci: deploy ${{ env.TAG }} to stage"
+          next-step: "After the merge, Argo CD syncs caresignal-stage within about 3 minutes (Kyverno verifies the signatures)."

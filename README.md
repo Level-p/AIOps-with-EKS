@@ -70,8 +70,10 @@ Run locally without a cluster: `records-api` needs PostgreSQL (`DB_HOST`, `DB_US
 ## Deploy
 
 1. `cd terraform && ./create-remote-state.sh` (state bucket, GitHub OIDC role, certificate).
-2. GitHub: secrets `AWS_ROLE_ARN`, `ALERT_SLACK_WEBHOOK_URL`, optional `ANTHROPIC_API_KEY` (aiops-engine) and `ASSISTANT_ANTHROPIC_API_KEY` (clinical assistant); environments `infrastructure`, `production`, `stage`; branch protection with Code Owners; label `ai-assisted`.
-3. Actions: **CareSignal Infrastructure → apply**, then **CareSignal Application → Run workflow**, then **CareSignal Promote to Production** and Sync `caresignal-prod` in Argo CD.
+2. GitHub: secrets `AWS_ROLE_ARN`, `ALERT_SLACK_WEBHOOK_URL`, optional `ANTHROPIC_API_KEY` (aiops-engine) and `ASSISTANT_ANTHROPIC_API_KEY` (clinical assistant); environments `infrastructure`, `production`, `stage`; branch protection with Code Owners; label `ai-assisted`; *Settings > Actions > General*: tick **Allow GitHub Actions to create and approve pull requests** (the pipelines deliver their GitOps changes as pull requests, because `main` is protected).
+3. Actions: **CareSignal Infrastructure → apply**, then **CareSignal Application → Run workflow** (it opens a pull
+   request with the new stage tags: **merge it** to deploy stage), then **CareSignal Promote to Production** (another
+   pull request: merge it) and Sync `caresignal-prod` in Argo CD.
 4. `python scripts/simulate_devices.py ...` creates synthetic patients and records; open the dashboard and try the assistant.
 
 Cost: about $340/month while running, plus model usage (bounded by the assistant's token budget). Destroy with **CareSignal Infrastructure → destroy**.

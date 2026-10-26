@@ -4,9 +4,9 @@
 #      versions about to be promoted are running there
 #   1. approval of the "production" environment (required reviewers)
 #   2. the same image tags (already signed, scanned and running in stage) are
-#      copied into values-prod.yaml and pushed
+#      copied into values-prod.yaml, as a PULL REQUEST (main is protected): merge it
 #   3. Argo CD shows caresignal-prod OutOfSync; a person reviews the diff and syncs
-# Roll back: git revert the promotion commit, push, Sync.
+# Roll back: a pull request reverting the promotion, merge, Sync.
 # ---------------------------------------------------------------------------
 name: CareSignal Promote to Production
 
@@ -39,7 +39,8 @@ jobs:
     needs: dast
     runs-on: ubuntu-latest
     permissions:
-      contents: write
+      contents: write        # push the gitops/prod-* branch
+      pull-requests: write   # open its pull request
     environment:
       name: production
       url: https://caresignal.${{ vars.DOMAIN_NAME || 'mfon21.space' }}
@@ -54,15 +55,11 @@ jobs:
             NAME="$name" TAG="$TAG" yq -i '.services[strenv(NAME)].tag = strenv(TAG)' "$CHART/values-prod.yaml"
           done
           { echo '### Changes for production'; echo '```diff'; git diff -- "$CHART/values-prod.yaml"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
-      - name: Commit and push
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add "$CHART/values-prod.yaml"
-          if git diff --cached --quiet; then echo "Production already runs the stage versions." >> "$GITHUB_STEP_SUMMARY"; exit 0; fi
-          git commit -m "ci: promote stage images to prod (run $GITHUB_RUN_NUMBER) [skip ci]"
-          for attempt in 1 2 3 4 5; do
-            git pull --rebase origin main && git push origin HEAD:main && break
-            sleep $((attempt * 5))
-          done
-          echo "Prod values updated. In Argo CD review **caresignal-prod** (APP DIFF) and press **SYNC**." >> "$GITHUB_STEP_SUMMARY"
+      - name: Stage the change
+        run: git add "$CHART/values-prod.yaml"
+      # main is protected (pull requests only): the promotion is a pull request; after the merge, SYNC in Argo CD
+      - uses: ./.github/actions/gitops-pr
+        with:
+          branch: gitops/prod-run${{ github.run_number }}
+          title: "ci: promote stage images to prod (run ${{ github.run_number }})"
+          next-step: "After the merge, Argo CD shows caresignal-prod OutOfSync: review the APP DIFF and press SYNC."
