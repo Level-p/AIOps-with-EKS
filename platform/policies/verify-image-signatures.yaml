@@ -30,7 +30,7 @@ spec:
             - entries:
                 - keyless:
                     issuer: https://token.actions.githubusercontent.com
-                    subjectRegExp: "^https://github\.com/Level-p/AIOps-with-EKS/\.github/workflows/app\.yml@refs/heads/main$"
+                    subjectRegExp: '^https://github\.com/Level-p/AIOps-with-EKS/\.github/workflows/app\.yml@refs/heads/main$'   # single quotes: backslashes stay literal
                     rekor:
                       url: https://rekor.sigstore.dev
           # The SBOM (CycloneDX) attached by the pipeline must exist and come from the same workflow
@@ -40,6 +40,6 @@ spec:
                 - entries:
                     - keyless:
                         issuer: https://token.actions.githubusercontent.com
-                        subjectRegExp: "^https://github\.com/Level-p/AIOps-with-EKS/\.github/workflows/app\.yml@refs/heads/main$"
+                        subjectRegExp: '^https://github\.com/Level-p/AIOps-with-EKS/\.github/workflows/app\.yml@refs/heads/main$'   # single quotes: backslashes stay literal
                         rekor:
                           url: https://rekor.sigstore.dev

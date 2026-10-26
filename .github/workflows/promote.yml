@@ -32,6 +32,7 @@ jobs:
     permissions:
       contents: read
       security-events: write
+      id-token: write          # the scan reads the stage tokens from the cluster (OIDC -> AWS)
     secrets: inherit
 
   promote:
