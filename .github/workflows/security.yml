@@ -165,7 +165,7 @@ jobs:
           mkdir -p rendered
           helm template caresignal deploy/helm/caresignal -n caresignal-prod -f deploy/helm/caresignal/values-prod.yaml > rendered/caresignal.yaml
           helm template aiops-engine deploy/helm/aiops-engine -n aiops > rendered/aiops-engine.yaml
-      - uses: bridgecrewio/checkov-action@99bb2caf247dfd9f03cf984373bc6043d4e32ebf # v12.1347.0
+      - uses: bridgecrewio/checkov-action@c3e106d5f8f4253a6de5110efb41a080f83db294 # v12.3135.0
         with:
           directory: .
           framework: terraform,kubernetes,dockerfile,github_actions
