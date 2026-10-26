@@ -1,12 +1,10 @@
 image:
   registry: 127214197057.dkr.ecr.eu-west-2.amazonaws.com
   repository: caresignal/aiops-engine
-  tag: initial          # written by the app workflow
-replicas: 1             # the anomaly detector keeps state in memory; one replica avoids duplicate pages
-
+  tag: r22-528eaef # written by the app workflow
+replicas: 1 # the anomaly detector keeps state in memory; one replica avoids duplicate pages
 # Secret created by Terraform: SLACK_WEBHOOK_URL, WEBHOOK_TOKEN, ANTHROPIC_API_KEY (optional)
 secretName: aiops-secrets
-
 config:
   PROMETHEUS_URL: http://kube-prometheus-stack-prometheus.monitoring:9090
   LOKI_URL: http://loki.observability:3100
@@ -15,11 +13,9 @@ config:
   AIOPS_LLM_CALLS_PER_HOUR: "20"
   AIOPS_LLM_DEDUPE_SECONDS: "1800"
   AIOPS_INTERVAL: "60"
-
 # Namespaces whose Kubernetes events the engine may read (evidence)
 watchNamespaces: [caresignal-prod, caresignal-stage]
 argocdNamespace: argocd
-
 resources:
-  requests: { cpu: 50m, memory: 128Mi }
-  limits: { memory: 256Mi }
+  requests: {cpu: 50m, memory: 128Mi}
+  limits: {memory: 256Mi}
