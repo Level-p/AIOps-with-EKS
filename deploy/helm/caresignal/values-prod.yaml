@@ -3,20 +3,16 @@
 global:
   environment: prod
   imageRegistry: 127214197057.dkr.ecr.eu-west-2.amazonaws.com
-
 services:
   vitals-ingest:
-    tag: initial
+    tag: r22-528eaef
   records-api:
-    tag: initial
+    tag: r22-528eaef
   clinical-assistant:
-    tag: initial
-
+    tag: r22-528eaef
 otel:
   tracesSamplerArg: "0.5"
-
 ingress:
   host: caresignal.mfon21.space
-
 monitoring:
   grafanaDashboard: true
