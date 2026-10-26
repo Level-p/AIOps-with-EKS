@@ -3,24 +3,21 @@
 global:
   environment: stage
   imageRegistry: 127214197057.dkr.ecr.eu-west-2.amazonaws.com
-
 services:
   vitals-ingest:
-    tag: initial
-    autoscaling: { enabled: true, minReplicas: 1, maxReplicas: 3, targetCPU: 70 }
+    tag: r22-528eaef
+    autoscaling: {enabled: true, minReplicas: 1, maxReplicas: 3, targetCPU: 70}
   records-api:
-    tag: initial
-    autoscaling: { enabled: true, minReplicas: 1, maxReplicas: 3, targetCPU: 70 }
+    tag: r22-528eaef
+    autoscaling: {enabled: true, minReplicas: 1, maxReplicas: 3, targetCPU: 70}
   clinical-assistant:
-    tag: initial
-    autoscaling: { enabled: true, minReplicas: 1, maxReplicas: 2, targetCPU: 70 }
+    tag: r22-528eaef
+    autoscaling: {enabled: true, minReplicas: 1, maxReplicas: 2, targetCPU: 70}
     env:
       LLM_DAILY_TOKEN_BUDGET: "500000"
-
 postgres:
   instances: 2
   synchronousMode: false
-  persistence: { size: 5Gi, storageClass: gp3 }
-
+  persistence: {size: 5Gi, storageClass: gp3}
 ingress:
   host: caresignal-stage.mfon21.space
