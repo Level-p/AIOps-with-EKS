@@ -2,7 +2,7 @@
 # Base images pinned by digest (Dependabot proposes updates). Dependencies come from the
 # committed package-lock.json with integrity hashes (npm ci), install scripts disabled, and no
 # dev dependencies. The runtime image is distroless: no shell, no package manager, non-root.
-FROM node:24-trixie-slim@sha256:7f486cabe892bff8fef04c0f7da8dba84a560be3e4e2740b7a86afc57ebec315 AS build
+FROM node:26-trixie-slim@sha256:36793bcbb160a6a16cede1e62b93f84e26b78a972a8a4c0b879c1c12f22761ec AS build
 WORKDIR /app
 COPY package.json package-lock.json ./
 RUN npm ci --omit=dev --ignore-scripts --no-audit --no-fund && npm cache clean --force
