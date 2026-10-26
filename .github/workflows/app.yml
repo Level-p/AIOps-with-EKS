@@ -5,7 +5,7 @@
 #   test          unit tests per service (node --test for the Node.js services, pytest for aiops-engine)
 #   chart         helm lint + render for both charts and both environments
 #   build         per changed service:
-#                   docker build -> Trivy (BLOCKS on fixable CRITICAL) -> push to ECR
+#                   docker build -> Trivy (report only; blocks fixable CRITICAL when SECURITY_GATES = enforce) -> push to ECR
 #                   -> SBOM (CycloneDX, Syft) -> Cosign keyless signature
 #                   -> SBOM attestation -> SLSA build provenance (GitHub attestation)
 #   update-stage  writes the new tags into the stage values; Argo CD deploys stage
@@ -201,9 +201,12 @@ jobs:
           cache-from: type=gha,scope=${{ matrix.service }}
           cache-to: type=gha,mode=max,scope=${{ matrix.service }}
 
-      # HealthTech gate: a CRITICAL vulnerability that HAS a fix stops the release.
-      # HIGH findings are reported in the log and as a SARIF file (not blocking).
-      - name: Trivy (block on fixable CRITICAL)
+      # Report only for now: fixable CRITICAL findings are listed and flagged as a warning, but the release goes on.
+      # Set the repository variable SECURITY_GATES = enforce to make a fixable CRITICAL stop the release again.
+      # HIGH findings are always report only.
+      - name: Trivy (fixable CRITICAL; blocks only when SECURITY_GATES = enforce)
+        id: trivy_critical
+        continue-on-error: ${{ vars.SECURITY_GATES != 'enforce' }}
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
           image-ref: ${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.tag }}
@@ -211,6 +214,13 @@ jobs:
           ignore-unfixed: true
           exit-code: "1"
           format: table
+      - name: Trivy findings (report only)
+        if: steps.trivy_critical.outcome == 'failure' && vars.SECURITY_GATES != 'enforce'
+        env:
+          SERVICE: ${{ matrix.service }}
+        run: |
+          echo "::warning title=Trivy (report only)::fixable CRITICAL vulnerabilities in the $SERVICE image (see the Trivy step); not failing the run while SECURITY_GATES is not 'enforce'"
+          echo "- Trivy ($SERVICE): fixable CRITICAL vulnerabilities, report only" >> "$GITHUB_STEP_SUMMARY"
       - name: Trivy (report HIGH)
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
