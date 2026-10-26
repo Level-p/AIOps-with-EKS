@@ -1,0 +1,191 @@
+openapi: 3.0.3
+# The public CareSignal API, exactly as the ALB ingress exposes it (one host per environment):
+#   /v1/readings    -> vitals-ingest       (X-Device-Token)
+#   /api/assistant  -> clinical-assistant  (clinician bearer token)
+#   /api, /         -> records-api         (clinician bearer token; dashboard)
+#   /internal/*     -> 404 at the load balancer (not part of this contract)
+# OWASP ZAP imports this file so the active scan reaches every operation and parameter,
+# not only the pages a spider can find. Keep it in step with the services (the DAST job
+# fails if an operation returns 404 for a valid request: see dast/README.md).
+# PATIENT_ID_PLACEHOLDER is replaced with a real patient id before each scan.
+info:
+  title: CareSignal public API
+  version: "2.0"
+servers:
+  - url: http://localhost:8080
+security:
+  - clinician: []
+components:
+  securitySchemes:
+    clinician: { type: http, scheme: bearer }
+    device: { type: apiKey, in: header, name: X-Device-Token }
+  parameters:
+    PatientId:
+      name: id
+      in: path
+      required: true
+      schema: { type: string, format: uuid, example: PATIENT_ID_PLACEHOLDER }
+    Purpose:
+      name: X-Access-Purpose
+      in: header
+      required: false
+      schema: { type: string, enum: [care], example: care }
+  schemas:
+    Error:
+      type: object
+      properties: { error: { type: string } }
+  responses:
+    Unauthorised: { description: missing or wrong token, content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+    NotFound: { description: unknown patient, content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+    Invalid: { description: request failed validation, content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+paths:
+  /healthz:
+    get:
+      security: []
+      responses: { "200": { description: alive } }
+  /api/patients:
+    get:
+      parameters:
+        - $ref: "#/components/parameters/Purpose"
+        - { name: ward, in: query, required: false, schema: { type: string, example: A1 } }
+      responses: { "200": { description: ward list }, "401": { $ref: "#/components/responses/Unauthorised" } }
+    post:
+      parameters: [{ $ref: "#/components/parameters/Purpose" }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [pseudonym, ward]
+              properties:
+                pseudonym: { type: string, example: DAST probe 1 }
+                ward: { type: string, example: DAST }
+                age_band: { type: string, enum: ["0-17", "18-39", "40-64", "65-79", "80+"], example: "40-64" }
+                sex: { type: string, enum: [female, male, other, unknown], example: unknown }
+      responses: { "201": { description: created }, "422": { $ref: "#/components/responses/Invalid" } }
+  /api/patients/{id}:
+    get:
+      parameters: [{ $ref: "#/components/parameters/PatientId" }, { $ref: "#/components/parameters/Purpose" }]
+      responses: { "200": { description: the record }, "404": { $ref: "#/components/responses/NotFound" } }
+  /api/patients/{id}/audit:
+    get:
+      parameters: [{ $ref: "#/components/parameters/PatientId" }]
+      responses: { "200": { description: audit trail } }
+  /api/patients/{id}/medications:
+    post:
+      parameters: [{ $ref: "#/components/parameters/PatientId" }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [name, dose, route, frequency]
+              properties:
+                name: { type: string, example: Paracetamol }
+                dose: { type: string, example: 1 g }
+                route: { type: string, enum: [oral, iv, im, sc, inhaled, topical, other], example: oral }
+                frequency: { type: string, example: every 6 hours }
+                status: { type: string, enum: [active, stopped], example: active }
+      responses: { "201": { description: added }, "422": { $ref: "#/components/responses/Invalid" } }
+  /api/patients/{id}/allergies:
+    post:
+      parameters: [{ $ref: "#/components/parameters/PatientId" }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [substance, severity]
+              properties:
+                substance: { type: string, example: Penicillin }
+                reaction: { type: string, example: rash }
+                severity: { type: string, enum: [mild, moderate, severe], example: moderate }
+      responses: { "201": { description: added }, "422": { $ref: "#/components/responses/Invalid" } }
+  /api/patients/{id}/problems:
+    post:
+      parameters: [{ $ref: "#/components/parameters/PatientId" }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [description]
+              properties:
+                description: { type: string, example: Community-acquired pneumonia }
+                status: { type: string, enum: [active, resolved], example: active }
+      responses: { "201": { description: added }, "422": { $ref: "#/components/responses/Invalid" } }
+  /api/patients/{id}/notes:
+    post:
+      parameters: [{ $ref: "#/components/parameters/PatientId" }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [kind, body]
+              properties:
+                kind: { type: string, enum: [progress, admission, nursing, handover, discharge], example: progress }
+                body: { type: string, example: Comfortable overnight. }
+      responses: { "201": { description: added }, "422": { $ref: "#/components/responses/Invalid" } }
+  /api/assistant/patients/{id}/summary:
+    post:
+      parameters: [{ $ref: "#/components/parameters/PatientId" }]
+      responses: { "200": { description: grounded summary or rule-based fallback }, "502": { description: record unavailable } }
+  /api/assistant/patients/{id}/ask:
+    post:
+      parameters: [{ $ref: "#/components/parameters/PatientId" }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [question]
+              properties:
+                question: { type: string, example: "What are the current medications?" }
+      responses: { "200": { description: answer with citations }, "400": { description: refused by the question guard } }
+  /api/assistant/patients/{id}/draft:
+    post:
+      parameters: [{ $ref: "#/components/parameters/PatientId" }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [kind]
+              properties:
+                kind: { type: string, enum: [handover, discharge], example: handover }
+      responses: { "201": { description: draft saved, unsigned }, "422": { $ref: "#/components/responses/Invalid" } }
+  /v1/readings:
+    post:
+      security: [{ device: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [patient_id, device_id, heart_rate, respiratory_rate, spo2, systolic_bp, temperature]
+              properties:
+                patient_id: { type: string, format: uuid, example: PATIENT_ID_PLACEHOLDER }
+                device_id: { type: string, example: dast.monitor }
+                heart_rate: { type: integer, example: 88 }
+                respiratory_rate: { type: integer, example: 16 }
+                spo2: { type: integer, example: 97 }
+                systolic_bp: { type: integer, example: 124 }
+                temperature: { type: number, example: 37.1 }
+      responses: { "202": { description: accepted }, "401": { $ref: "#/components/responses/Unauthorised" } }

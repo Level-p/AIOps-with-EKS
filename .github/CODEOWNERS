@@ -1,0 +1,8 @@
+# Every pull request needs a review from an owner (branch protection: "Require review from Code Owners").
+# For AI-assisted pull requests this human review is the control the AI policy relies on.
+*                       @Level-p
+/.github/               @Level-p
+/platform/policies/     @Level-p
+/terraform/             @Level-p
+/.semgrep/              @Level-p
+/scripts/               @Level-p

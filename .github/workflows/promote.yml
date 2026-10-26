@@ -1,0 +1,68 @@
+# ---------------------------------------------------------------------------
+# CareSignal: promote what runs in stage to production (GitOps, two keys)
+#   0. DAST gate: an OWASP ZAP baseline scan of stage (dast.yml) must pass: the exact
+#      versions about to be promoted are running there
+#   1. approval of the "production" environment (required reviewers)
+#   2. the same image tags (already signed, scanned and running in stage) are
+#      copied into values-prod.yaml and pushed
+#   3. Argo CD shows caresignal-prod OutOfSync; a person reviews the diff and syncs
+# Roll back: git revert the promotion commit, push, Sync.
+# ---------------------------------------------------------------------------
+name: CareSignal Promote to Production
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: caresignal-gitops-refs/heads/main
+  cancel-in-progress: false
+
+env:
+  CHART: deploy/helm/caresignal
+
+jobs:
+  dast:
+    name: DAST gate (ZAP baseline of stage)
+    uses: ./.github/workflows/dast.yml
+    with:
+      target: stage
+    permissions:
+      contents: read
+      security-events: write
+    secrets: inherit
+
+  promote:
+    name: Copy stage tags to prod
+    needs: dast
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    environment:
+      name: production
+      url: https://caresignal.${{ vars.DOMAIN_NAME || 'mfon21.space' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
+      - name: Copy tags
+        run: |
+          for name in $(yq -r '.services | keys | .[]' "$CHART/values-stage.yaml"); do
+            TAG=$(NAME="$name" yq '.services[strenv(NAME)].tag' "$CHART/values-stage.yaml")
+            NAME="$name" TAG="$TAG" yq -i '.services[strenv(NAME)].tag = strenv(TAG)' "$CHART/values-prod.yaml"
+          done
+          { echo '### Changes for production'; echo '```diff'; git diff -- "$CHART/values-prod.yaml"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+      - name: Commit and push
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add "$CHART/values-prod.yaml"
+          if git diff --cached --quiet; then echo "Production already runs the stage versions." >> "$GITHUB_STEP_SUMMARY"; exit 0; fi
+          git commit -m "ci: promote stage images to prod (run $GITHUB_RUN_NUMBER) [skip ci]"
+          for attempt in 1 2 3 4 5; do
+            git pull --rebase origin main && git push origin HEAD:main && break
+            sleep $((attempt * 5))
+          done
+          echo "Prod values updated. In Argo CD review **caresignal-prod** (APP DIFF) and press **SYNC**." >> "$GITHUB_STEP_SUMMARY"

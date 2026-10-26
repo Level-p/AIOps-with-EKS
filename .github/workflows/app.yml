@@ -1,0 +1,308 @@
+# ---------------------------------------------------------------------------
+# CareSignal application: CI + supply chain + GitOps
+#
+#   changes       which services changed (only those are rebuilt)
+#   test          unit tests per service (node --test for the Node.js services, pytest for aiops-engine)
+#   chart         helm lint + render for both charts and both environments
+#   build         per changed service:
+#                   docker build -> Trivy (BLOCKS on fixable CRITICAL) -> push to ECR
+#                   -> SBOM (CycloneDX, Syft) -> Cosign keyless signature
+#                   -> SBOM attestation -> SLSA build provenance (GitHub attestation)
+#   update-stage  writes the new tags into the stage values; Argo CD deploys stage
+#
+# In the cluster, Kyverno admits a CareSignal image ONLY if it was signed by this
+# workflow on main (platform/policies/verify-image-signatures.yaml). The Kyverno
+# subject regexp names this file: keep the file name app.yml.
+#
+# Pull requests test, build and scan, but push and sign nothing.
+# Required secret: AWS_ROLE_ARN. The workflow never talks to the cluster.
+# ---------------------------------------------------------------------------
+name: CareSignal Application
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "services/**"
+      - "deploy/helm/**"
+      - ".github/workflows/app.yml"
+  pull_request:
+    paths:
+      - "services/**"
+      - "deploy/helm/**"
+      - ".github/workflows/app.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: caresignal-gitops-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: eu-west-2
+  ECR_PREFIX: caresignal
+  HELM_VERSION: v3.22.0
+
+jobs:
+  changes:
+    name: Detect changed services
+    runs-on: ubuntu-latest
+    outputs:
+      services: ${{ steps.pick.outputs.services }}
+      chart: ${{ steps.filter.outputs.chart }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3
+        id: filter
+        with:
+          filters: |
+            vitals-ingest: services/vitals-ingest/**
+            records-api: services/records-api/**
+            clinical-assistant: services/clinical-assistant/**
+            aiops-engine: services/aiops-engine/**
+            chart: deploy/helm/**
+      - name: Services to build
+        id: pick
+        env:
+          CHANGED: ${{ steps.filter.outputs.changes }}
+          EVENT: ${{ github.event_name }}
+        run: |
+          ALL='["vitals-ingest","records-api","clinical-assistant","aiops-engine"]'
+          if [ "$EVENT" = "workflow_dispatch" ]; then SELECTED="$ALL"
+          else SELECTED=$(jq -c --argjson c "$CHANGED" '[.[] | select(. as $n | $c | index($n))]' <<< "$ALL"); fi
+          echo "services=$SELECTED" >> "$GITHUB_OUTPUT"
+          echo "### Services to build: $SELECTED" >> "$GITHUB_STEP_SUMMARY"
+
+  test:
+    name: Test ${{ matrix.service }}
+    needs: changes
+    if: needs.changes.outputs.services != '[]'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        service: ${{ fromJSON(needs.changes.outputs.services) }}
+    defaults:
+      run:
+        working-directory: services/${{ matrix.service }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # ---- Node.js services (package-lock.json with integrity hashes) ----
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        if: hashFiles(format('services/{0}/package-lock.json', matrix.service)) != ''
+        with:
+          node-version: "24"
+      # npm ci installs exactly the lockfile (fails if it does not match package.json) and
+      # checks every package against its sha512 integrity; no install scripts run
+      - name: Install (lockfile, integrity-verified, no scripts)
+        if: hashFiles(format('services/{0}/package-lock.json', matrix.service)) != ''
+        run: npm ci --ignore-scripts --no-fund
+      - name: Unit tests (node --test)
+        if: hashFiles(format('services/{0}/package-lock.json', matrix.service)) != ''
+        env:
+          OTEL_SDK_DISABLED: "true"
+        run: npm test
+
+      # ---- Python service (aiops-engine) ----
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        if: hashFiles(format('services/{0}/requirements.txt', matrix.service)) != ''
+        with:
+          python-version: "3.12"
+      # --require-hashes: the exact, verified packages from requirements.txt, nothing else
+      - name: Install (hash-verified)
+        if: hashFiles(format('services/{0}/requirements.txt', matrix.service)) != ''
+        run: |
+          pip install --require-hashes -r requirements.txt
+          pip install -r requirements-dev.in
+      - name: Unit tests (pytest)
+        if: hashFiles(format('services/{0}/requirements.txt', matrix.service)) != ''
+        run: python -m pytest -q
+
+  chart:
+    name: Helm lint and render
+    needs: changes
+    if: needs.changes.outputs.chart == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        with:
+          version: ${{ env.HELM_VERSION }}
+      - name: Lint and render
+        run: |
+          for env in stage prod; do
+            helm lint deploy/helm/caresignal -f deploy/helm/caresignal/values-$env.yaml
+            helm template caresignal deploy/helm/caresignal -n caresignal-$env -f deploy/helm/caresignal/values-$env.yaml > /dev/null
+          done
+          helm lint deploy/helm/aiops-engine
+          helm template aiops-engine deploy/helm/aiops-engine -n aiops > /dev/null
+
+  build:
+    name: Build, scan, sign ${{ matrix.service }}
+    needs: [changes, test]
+    if: needs.changes.outputs.services != '[]'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        service: ${{ fromJSON(needs.changes.outputs.services) }}
+    permissions:
+      contents: read
+      id-token: write       # OIDC: AWS login AND Sigstore keyless signing
+      attestations: write   # GitHub build provenance
+    env:
+      PUSH: ${{ github.event_name != 'pull_request' && github.ref == 'refs/heads/main' }}
+    outputs:
+      registry: ${{ steps.ecr.outputs.registry }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Configure AWS credentials (OIDC)
+        if: env.PUSH == 'true'
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Log in to Amazon ECR
+        if: env.PUSH == 'true'
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@03f1aad4c6c7ffd436567f42f9384779290529bd # v2.1.7
+
+      - name: Image name
+        id: meta
+        env:
+          REGISTRY: ${{ steps.ecr.outputs.registry || 'local' }}
+          SERVICE: ${{ matrix.service }}
+        run: |
+          TAG="r${GITHUB_RUN_NUMBER}-${GITHUB_SHA::7}"
+          echo "image=$REGISTRY/$ECR_PREFIX/$SERVICE" >> "$GITHUB_OUTPUT"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Build
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: services/${{ matrix.service }}
+          load: true
+          provenance: false
+          tags: ${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.tag }}
+          cache-from: type=gha,scope=${{ matrix.service }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.service }}
+
+      # HealthTech gate: a CRITICAL vulnerability that HAS a fix stops the release.
+      # HIGH findings are reported in the log and as a SARIF file (not blocking).
+      - name: Trivy (block on fixable CRITICAL)
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: ${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.tag }}
+          severity: CRITICAL
+          ignore-unfixed: true
+          exit-code: "1"
+          format: table
+      - name: Trivy (report HIGH)
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: ${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.tag }}
+          severity: HIGH
+          ignore-unfixed: true
+          exit-code: "0"
+          format: table
+
+      - name: Push to ECR
+        if: env.PUSH == 'true'
+        id: push
+        env:
+          IMAGE: ${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.tag }}
+        run: |
+          docker push "$IMAGE"
+          DIGEST=$(docker inspect --format '{{index .RepoDigests 0}}' "$IMAGE" | cut -d@ -f2)
+          echo "digest=$DIGEST" >> "$GITHUB_OUTPUT"
+          echo "Pushed $IMAGE@$DIGEST" >> "$GITHUB_STEP_SUMMARY"
+
+      # ---- Supply chain: SBOM, signature, attestations (all on the immutable digest) ----
+      - name: SBOM (CycloneDX)
+        if: env.PUSH == 'true'
+        uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
+        with:
+          image: ${{ steps.meta.outputs.image }}@${{ steps.push.outputs.digest }}
+          format: cyclonedx-json
+          output-file: sbom.cdx.json
+          upload-artifact: true
+
+      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        if: env.PUSH == 'true'
+
+      # Keyless: GitHub's OIDC token proves "this workflow, this repo, this branch";
+      # Fulcio issues a short-lived certificate; the signature is logged in Rekor.
+      - name: Sign image and attach the SBOM attestation
+        if: env.PUSH == 'true'
+        env:
+          REF: ${{ steps.meta.outputs.image }}@${{ steps.push.outputs.digest }}
+        run: |
+          cosign sign --yes "$REF"
+          cosign attest --yes --type cyclonedx --predicate sbom.cdx.json "$REF"
+          cosign verify "$REF" \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+            --certificate-identity "https://github.com/${GITHUB_REPOSITORY}/.github/workflows/app.yml@refs/heads/main" > /dev/null
+          echo "Signed and verified: $REF" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: SLSA build provenance
+        if: env.PUSH == 'true'
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ${{ steps.meta.outputs.image }}
+          subject-digest: ${{ steps.push.outputs.digest }}
+          push-to-registry: true
+
+  update-stage:
+    name: Deploy to stage (GitOps commit)
+    needs: [changes, build]
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    environment:
+      name: stage
+      url: https://caresignal-stage.${{ vars.DOMAIN_NAME || 'mfon21.space' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
+      - name: Write the new tags
+        env:
+          SERVICES: ${{ needs.changes.outputs.services }}
+        run: |
+          TAG="r${GITHUB_RUN_NUMBER}-${GITHUB_SHA::7}"
+          for name in $(jq -r '.[]' <<< "$SERVICES"); do
+            if [ "$name" = aiops-engine ]; then
+              TAG="$TAG" yq -i '.image.tag = strenv(TAG)' deploy/helm/aiops-engine/values.yaml
+            else
+              NAME="$name" TAG="$TAG" yq -i '.services[strenv(NAME)].tag = strenv(TAG)' deploy/helm/caresignal/values-stage.yaml
+            fi
+          done
+          git diff
+          echo "TAG=$TAG" >> "$GITHUB_ENV"
+      - name: Commit and push
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add deploy/helm
+          if git diff --cached --quiet; then echo "Nothing to commit"; exit 0; fi
+          git commit -m "ci: deploy $TAG to stage [skip ci]"
+          for attempt in 1 2 3 4 5; do
+            git pull --rebase origin main && git push origin HEAD:main && break
+            sleep $((attempt * 5))
+          done
+          echo "Stage updated to \`$TAG\`; Argo CD syncs within about 3 minutes (Kyverno verifies the signatures)." >> "$GITHUB_STEP_SUMMARY"

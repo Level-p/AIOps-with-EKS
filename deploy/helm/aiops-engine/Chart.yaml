@@ -1,0 +1,6 @@
+apiVersion: v2
+name: aiops-engine
+description: CareSignal AIOps engine - Alertmanager enrichment, anomaly detection, AI-assisted triage to Slack (read-only, suggests only)
+type: application
+version: 1.0.0
+appVersion: "1.0.0"

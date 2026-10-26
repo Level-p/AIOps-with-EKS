@@ -1,0 +1,5 @@
+CareSignal ({{ .Values.global.environment }}) deployed to {{ .Release.Namespace }}.
+  Dashboard and record API:    https://{{ .Values.ingress.host }}/
+  Clinical assistant (LLM):    https://{{ .Values.ingress.host }}/api/assistant/patients/<id>/{summary,ask,draft}
+  Device endpoint:             https://{{ .Values.ingress.host }}/v1/readings  (header X-Device-Token)
+Synthetic data only: not for clinical use.

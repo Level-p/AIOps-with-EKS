@@ -1,0 +1,112 @@
+# CareSignal defaults. values-stage.yaml / values-prod.yaml override per environment;
+# the pipeline only ever changes services.<name>.tag in values-stage.yaml (and the
+# promotion pull request copies it to values-prod.yaml).
+
+global:
+  environment: stage
+  imageRegistry: ""          # <account>.dkr.ecr.eu-west-2.amazonaws.com (set per environment)
+  imagePullPolicy: IfNotPresent
+
+# Secret created by Terraform (module app-namespaces): device-token, internal-token, clinician-token,
+# anthropic-api-key (clinical-assistant)
+appSecret: caresignal-app-secrets
+
+# OpenTelemetry: every service sends traces and metrics over OTLP/gRPC to the gateway collector
+otel:
+  endpoint: http://otel-gateway-opentelemetry-collector.observability.svc:4317
+  tracesSampler: parentbased_traceidratio
+  tracesSamplerArg: "1.0"    # keep all traces; the collector's tail sampling decides what is stored
+
+services:
+  vitals-ingest:
+    image: caresignal/vitals-ingest
+    tag: initial
+    port: 8080
+    replicas: 2
+    autoscaling: { enabled: true, minReplicas: 2, maxReplicas: 6, targetCPU: 70 }
+    probes: { liveness: /healthz, readiness: /healthz }
+    resources:
+      requests: { cpu: 50m, memory: 96Mi }
+      limits: { memory: 256Mi }
+    env:
+      RECORDS_API_URL: http://records-api:8080
+    secretEnv:
+      DEVICE_TOKEN: device-token
+      INTERNAL_TOKEN: internal-token
+  records-api:
+    image: caresignal/records-api
+    tag: initial
+    port: 8080
+    replicas: 2
+    autoscaling: { enabled: true, minReplicas: 2, maxReplicas: 6, targetCPU: 70 }
+    probes: { liveness: /healthz, readiness: /readyz }
+    resources:
+      requests: { cpu: 50m, memory: 128Mi }
+      limits: { memory: 320Mi }
+    database: { name: caresignal, user: caresignal }
+    secretEnv:
+      CLINICIAN_TOKEN: clinician-token
+      INTERNAL_TOKEN: internal-token
+  clinical-assistant:
+    image: caresignal/clinical-assistant
+    tag: initial
+    port: 8080
+    replicas: 2
+    autoscaling: { enabled: true, minReplicas: 2, maxReplicas: 4, targetCPU: 70 }
+    probes: { liveness: /healthz, readiness: /readyz }
+    resources:
+      requests: { cpu: 50m, memory: 128Mi }
+      limits: { memory: 320Mi }
+    internetEgress: true          # the only CareSignal pod that may reach the internet (api.anthropic.com:443)
+    env:
+      RECORDS_API_URL: http://records-api:8080
+      LLM_MODEL: claude-opus-5-5
+      LLM_EFFORT: medium
+      LLM_MAX_TOKENS: "8000"
+      LLM_DAILY_TOKEN_BUDGET: "2000000"   # per pod and UTC day; caresignal_llm_budget_remaining_ratio
+      RATE_LIMIT_PER_MINUTE: "20"         # per clinician credential and pod
+    secretEnv:
+      CLINICIAN_TOKEN: clinician-token
+      INTERNAL_TOKEN: internal-token
+    optionalSecretEnv:            # without a key the assistant runs rule-based only
+      ANTHROPIC_API_KEY: anthropic-api-key
+
+# Highly available PostgreSQL (Zalando postgres-operator): one pod per Availability Zone
+postgres:
+  clusterName: caresignal-db
+  instances: 3
+  version: "17"
+  synchronousMode: true      # a committed write exists on two servers before it is confirmed
+  persistence: { size: 10Gi, storageClass: gp3 }
+  databases:
+    caresignal: caresignal   # database: owner
+  resources:
+    requests: { cpu: 100m, memory: 256Mi }
+    limits: { memory: 512Mi }
+  clientImage: { repository: postgres, tag: 17-alpine }
+
+backup:
+  enabled: true
+  schedule: "15 2 * * *"
+  configMap: db-backup-config      # from Terraform: BACKUP_BUCKET, BACKUP_PREFIX, AWS_REGION
+  awsCliImage: { repository: public.ecr.aws/aws-cli/aws-cli, tag: "2.31.30" }
+
+ingress:
+  enabled: true
+  className: alb
+  groupName: caresignal
+  host: caresignal-stage.example.com
+  certificateArn: ""
+
+networkPolicy:
+  enabled: true
+  # The ALB sends traffic from its network interfaces in the public subnets (target-type ip)
+  albSourceCidrs: ["10.0.1.0/24", "10.0.2.0/24", "10.0.3.0/24"]
+  # Egress of the application pods: DNS, the OpenTelemetry gateway, each other, the database.
+  # Only pods with internetEgress may open HTTPS to public addresses (not to private ranges).
+  egress: true
+  privateRanges: ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "169.254.0.0/16"]
+
+monitoring:
+  prometheusRule: true
+  grafanaDashboard: false    # one copy only (prod); the dashboard has an environment selector

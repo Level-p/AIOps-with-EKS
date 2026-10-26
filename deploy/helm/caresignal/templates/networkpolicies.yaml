@@ -1,0 +1,134 @@
+{{- if .Values.networkPolicy.enabled }}
+{{- $pg := .Values.postgres }}
+{{- $np := .Values.networkPolicy }}
+# Zero trust inside the namespace: nothing may connect to a pod unless allowed below.
+# Enforced by the Amazon VPC CNI network policy agent (enableNetworkPolicy in Terraform).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-ingress
+spec:
+  podSelector: {}
+  policyTypes: [Ingress]
+---
+# Devices reach vitals-ingest only through the load balancer
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: vitals-ingest
+spec:
+  podSelector:
+    matchLabels: { app.kubernetes.io/name: vitals-ingest }
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        {{- range $np.albSourceCidrs }}
+        - ipBlock: { cidr: {{ . }} }
+        {{- end }}
+      ports: [{ port: 8080, protocol: TCP }]
+---
+# records-api: the load balancer (dashboard, record API), vitals-ingest and clinical-assistant
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: records-api
+spec:
+  podSelector:
+    matchLabels: { app.kubernetes.io/name: records-api }
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        {{- range $np.albSourceCidrs }}
+        - ipBlock: { cidr: {{ . }} }
+        {{- end }}
+        - podSelector:
+            matchLabels: { app.kubernetes.io/name: vitals-ingest }
+        - podSelector:
+            matchLabels: { app.kubernetes.io/name: clinical-assistant }
+      ports: [{ port: 8080, protocol: TCP }]
+---
+# clinical-assistant: only the load balancer (/api/assistant)
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: clinical-assistant
+spec:
+  podSelector:
+    matchLabels: { app.kubernetes.io/name: clinical-assistant }
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        {{- range $np.albSourceCidrs }}
+        - ipBlock: { cidr: {{ . }} }
+        {{- end }}
+      ports: [{ port: 8080, protocol: TCP }]
+---
+# The database: records-api, the backup job, its own members (replication, Patroni) and the operator
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $pg.clusterName }}
+spec:
+  podSelector:
+    matchLabels: { cluster-name: {{ $pg.clusterName }} }
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels: { app.kubernetes.io/name: records-api }
+        - podSelector:
+            matchLabels: { app.kubernetes.io/name: caresignal-db-backup }
+      ports: [{ port: 5432, protocol: TCP }]
+    - from:
+        - podSelector:
+            matchLabels: { cluster-name: {{ $pg.clusterName }} }
+        - namespaceSelector:
+            matchLabels: { kubernetes.io/metadata.name: postgres-operator }
+      ports: [{ port: 5432, protocol: TCP }, { port: 8008, protocol: TCP }]
+{{- if $np.egress }}
+{{- range $name, $svc := .Values.services }}
+---
+# Egress of {{ $name }}: DNS, the OpenTelemetry gateway, the CareSignal services
+{{- if $svc.database }}, the database{{ end }}
+{{- if $svc.internetEgress }}, and HTTPS to public addresses (the model provider){{ end }}.
+# Nothing else: a compromised pod cannot reach the internet, the node metadata service or other namespaces.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $name }}-egress
+spec:
+  podSelector:
+    matchLabels: { app.kubernetes.io/name: {{ $name }} }
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels: { kubernetes.io/metadata.name: kube-system }
+          podSelector:
+            matchLabels: { k8s-app: kube-dns }
+      ports: [{ port: 53, protocol: UDP }, { port: 53, protocol: TCP }]
+    - to:
+        - namespaceSelector:
+            matchLabels: { kubernetes.io/metadata.name: observability }
+      ports: [{ port: 4317, protocol: TCP }]
+    - to:
+        - podSelector:
+            matchLabels: { app.kubernetes.io/part-of: caresignal }
+      ports: [{ port: 8080, protocol: TCP }]
+    {{- if $svc.database }}
+    - to:
+        - podSelector:
+            matchLabels: { cluster-name: {{ $pg.clusterName }} }
+      ports: [{ port: 5432, protocol: TCP }]
+    {{- end }}
+    {{- if $svc.internetEgress }}
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              {{- toYaml $np.privateRanges | nindent 14 }}
+      ports: [{ port: 443, protocol: TCP }]
+    {{- end }}
+{{- end }}
+{{- end }}
+{{- end }}

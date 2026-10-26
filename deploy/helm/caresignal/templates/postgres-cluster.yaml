@@ -1,0 +1,53 @@
+{{- $pg := .Values.postgres -}}
+{{- $super := include "caresignal.dbSecret" (dict "root" . "user" "postgres") -}}
+# A highly available PostgreSQL cluster, self-managed in the cluster by the
+# Zalando postgres-operator (installed by Terraform). From this short
+# description the operator creates:
+#   - StatefulSet "{{ $pg.clusterName }}": {{ $pg.instances }} pods, each with its own EBS disk,
+#     each in a different Availability Zone
+#   - Patroni in every pod: one primary, the others copy every change from it and
+#     one of them is promoted automatically (about 30 s) if the primary fails
+#   - Service "{{ $pg.clusterName }}"      -> always the primary (the apps write here)
+#     Service "{{ $pg.clusterName }}-repl" -> the replicas (backups read here)
+#   - one database per service, each owned by its own user, and a password
+#     Secret per user: <user>.{{ $pg.clusterName }}.credentials.postgresql.acid.zalan.do
+#   - a PodDisruptionBudget, so a node upgrade never stops the primary and a replica together
+apiVersion: acid.zalan.do/v1
+kind: postgresql
+metadata:
+  name: {{ $pg.clusterName }}
+  labels:
+    {{- include "caresignal.labels" (dict "root" . "name" $pg.clusterName) | nindent 4 }}
+    app.kubernetes.io/component: postgres
+  annotations:
+    # Never let Argo CD delete the database, even if this file disappears from Git.
+    # Removing a database is a deliberate, manual act.
+    argocd.argoproj.io/sync-options: Prune=false,Delete=false
+    helm.sh/resource-policy: keep
+spec:
+  teamId: caresignal
+  numberOfInstances: {{ $pg.instances }}
+  postgresql:
+    version: {{ $pg.version | quote }}
+    parameters:
+      max_connections: "200"
+      # Long reads on a replica (backups) are not cancelled by changes on the primary
+      hot_standby_feedback: "on"
+      log_min_duration_statement: "1000"   # log queries slower than 1 s
+  patroni:
+    synchronous_mode: {{ $pg.synchronousMode }}
+    # If every replica is down the primary keeps accepting writes (ingest keeps working)
+    synchronous_mode_strict: false
+  volume:
+    size: {{ $pg.persistence.size }}
+    storageClass: {{ $pg.persistence.storageClass }}
+  users:
+    {{- range $db, $user := $pg.databases }}
+    {{ $user }}: []
+    {{- end }}
+  databases:
+    {{- range $db, $user := $pg.databases }}
+    {{ $db }}: {{ $user }}
+    {{- end }}
+  resources:
+    {{- toYaml $pg.resources | nindent 4 }}

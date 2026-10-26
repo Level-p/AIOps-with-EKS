@@ -1,0 +1,17 @@
+.terraform/
+*.tfstate
+*.tfstate.*
+tfplan
+*.tfvars
+__pycache__/
+.pytest_cache/
+.venv/
+venv/
+*.sarif
+rendered*/
+sbom*.json
+node_modules/
+
+# DAST (OWASP ZAP): reports and specs generated per run
+dast/reports/
+dast/openapi/*.generated.*

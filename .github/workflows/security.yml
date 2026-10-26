@@ -1,0 +1,215 @@
+# ---------------------------------------------------------------------------
+# DevSecOps gates for every pull request and every push to main (+ weekly):
+#
+#   secrets        Gitleaks over the git history                        (blocking)
+#   sast           Semgrep: registry rules + our AI-code rules           (ERROR findings block)
+#   codeql         GitHub CodeQL for JavaScript, Python and the workflows (results in Security tab)
+#   dependencies   dependency guard (hallucinated / brand-new / unapproved / too-fresh /
+#                  unpinned packages, lockfile integrity, unpinned actions) + npm audit
+#                  and pip-audit on the locked dependencies                    (blocking)
+#   dependency-review  new vulnerable or badly licensed dependencies in a PR  (blocking)
+#   iac            Checkov on Terraform and the rendered Helm charts     (report, SARIF)
+#   policy         the SAME Kyverno policies the cluster enforces, applied to the
+#                  rendered charts: a violation fails here, before Argo CD ever sees it
+# ---------------------------------------------------------------------------
+name: Security
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  schedule:
+    - cron: "17 3 * * 1"   # weekly: new CVEs appear in unchanged code
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: security-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  secrets:
+    name: Secrets (Gitleaks)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: gitleaks/gitleaks-action@e0c47f4f8be36e29cdc102c57e68cb5cbf0e8d1e # v3.0.0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  sast:
+    name: SAST (Semgrep)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    container:
+      image: semgrep/semgrep:1.181.0
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Rule self-test (our AI-code rules must still catch their examples)
+        run: |
+          semgrep --test --config .semgrep/ai-code-rules.yml .semgrep/ai-code-rules.js
+          semgrep --test --config .semgrep/ai-code-rules.yml .semgrep/ai-code-rules.py
+      - name: Scan
+        run: |
+          semgrep scan --metrics=off \
+            --config p/javascript --config p/nodejs --config p/expressjs --config p/python \
+            --config p/secrets --config p/github-actions --config p/dockerfile \
+            --config .semgrep/ai-code-rules.yml \
+            --exclude .semgrep --exclude node_modules \
+            --severity ERROR --error \
+            --sarif-output=semgrep.sarif --text
+      - name: Upload to the Security tab
+        if: always()
+        uses: github/codeql-action/upload-sarif@6f2ac81f5cd81fe351a197ba0b00d91d03cd2aee # v4
+        with:
+          sarif_file: semgrep.sarif
+          category: semgrep
+
+  codeql:
+    name: CodeQL (${{ matrix.language }})
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    strategy:
+      fail-fast: false
+      matrix:
+        language: [javascript-typescript, python, actions]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: github/codeql-action/init@6f2ac81f5cd81fe351a197ba0b00d91d03cd2aee # v4
+        with:
+          languages: ${{ matrix.language }}
+          queries: security-extended
+      - uses: github/codeql-action/analyze@6f2ac81f5cd81fe351a197ba0b00d91d03cd2aee # v4
+        with:
+          category: codeql-${{ matrix.language }}
+
+  dependencies:
+    name: Dependencies (guard + npm audit + pip-audit)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+      - name: Dependency guard (hallucinated, brand-new, unapproved packages; unpinned actions)
+        run: python scripts/dependency_guard.py
+      - name: Guard self-test
+        run: pip install pytest==9.1.1 && python -m pytest -q scripts/tests dast/tests
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "24"
+      - name: npm audit (known vulnerabilities in the production dependencies of the lockfiles)
+        run: |
+          for s in services/*/package-lock.json; do
+            d=$(dirname "$s")
+            echo "::group::$d"
+            (cd "$d" && npm audit --omit=dev --audit-level=high)
+            echo "::endgroup::"
+          done
+      - name: pip-audit (known vulnerabilities in the locked dependencies)
+        run: |
+          pip install pip-audit==2.10.1
+          for r in services/*/requirements.txt; do
+            echo "::group::$r"
+            pip-audit --require-hashes --disable-pip -r "$r"
+            echo "::endgroup::"
+          done
+
+  dependency-review:
+    name: Dependency review (PR)
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294 # v5.0.0
+        with:
+          fail-on-severity: high
+          deny-licenses: GPL-3.0-only, GPL-3.0-or-later, AGPL-3.0-only, AGPL-3.0-or-later
+          comment-summary-in-pr: on-failure
+
+  iac:
+    name: IaC (Checkov)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        with:
+          version: v3.22.0
+      - name: Render charts
+        run: |
+          mkdir -p rendered
+          helm template caresignal deploy/helm/caresignal -n caresignal-prod -f deploy/helm/caresignal/values-prod.yaml > rendered/caresignal.yaml
+          helm template aiops-engine deploy/helm/aiops-engine -n aiops > rendered/aiops-engine.yaml
+      - uses: bridgecrewio/checkov-action@99bb2caf247dfd9f03cf984373bc6043d4e32ebf # v12.1347.0
+        with:
+          directory: .
+          framework: terraform,kubernetes,dockerfile,github_actions
+          skip_path: .semgrep
+          soft_fail: true
+          output_format: cli,sarif
+          output_file_path: console,checkov.sarif
+      - uses: github/codeql-action/upload-sarif@6f2ac81f5cd81fe351a197ba0b00d91d03cd2aee # v4
+        if: always()
+        with:
+          sarif_file: checkov.sarif
+          category: checkov
+
+  policy:
+    name: Kyverno policies on the rendered charts
+    runs-on: ubuntu-latest
+    env:
+      KYVERNO_VERSION: v1.19.1
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        with:
+          version: v3.22.0
+      - name: Install the Kyverno CLI (checksum verified)
+        run: |
+          cd /tmp
+          curl -sSLO "https://github.com/kyverno/kyverno/releases/download/${KYVERNO_VERSION}/kyverno-cli_${KYVERNO_VERSION}_linux_x86_64.tar.gz"
+          curl -sSLO "https://github.com/kyverno/kyverno/releases/download/${KYVERNO_VERSION}/checksums.txt"
+          grep "kyverno-cli_${KYVERNO_VERSION}_linux_x86_64.tar.gz" checksums.txt | sha256sum -c -
+          tar -xzf "kyverno-cli_${KYVERNO_VERSION}_linux_x86_64.tar.gz" kyverno && sudo mv kyverno /usr/local/bin/
+      # Signature verification needs the registry; it is enforced in the cluster.
+      # Everything else is checked here exactly as the admission controller will:
+      # the rendered workloads are expanded into the Pods the cluster would create.
+      - name: Apply the workload-hardening policy to the Pods of both charts
+        run: |
+          pip install pyyaml==6.0.3 >/dev/null
+          check() {  # $1 = namespace, stdin = rendered chart
+            python scripts/render_pods.py "$1" > "pods-$1.yaml"
+            kyverno apply platform/policies/workload-hardening.yaml --resource "pods-$1.yaml" --detailed-results | tee "result-$1.txt"
+            grep -qE "fail: 0, warn: [0-9]+, error: 0" "result-$1.txt" || { echo "::error::Kyverno policy violations in $1"; return 1; }
+          }
+          for env in stage prod; do
+            helm template caresignal deploy/helm/caresignal -n caresignal-$env -f deploy/helm/caresignal/values-$env.yaml | check caresignal-$env
+          done
+          helm template aiops-engine deploy/helm/aiops-engine -n aiops | check aiops

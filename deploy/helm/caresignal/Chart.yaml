@@ -1,0 +1,11 @@
+apiVersion: v2
+name: caresignal
+description: >-
+  CareSignal LLM patient-records platform (synthetic data): vitals-ingest, records-api and
+  clinical-assistant (Node.js) with OpenTelemetry, a highly available PostgreSQL cluster
+  (Zalando operator), nightly backups to S3, ingress and egress NetworkPolicies, Prometheus
+  alert rules (service, clinical and LLM operations) and a Grafana dashboard.
+type: application
+version: 2.0.0
+appVersion: "2.0.0"
+keywords: [healthtech, llm, opentelemetry, gitops, eks]

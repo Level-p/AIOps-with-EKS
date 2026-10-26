@@ -1,0 +1,165 @@
+{{- /* One Deployment, Service, HPA and PDB per entry in .Values.services */ -}}
+{{- $root := . -}}
+{{- range $name, $svc := .Values.services }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "caresignal.labels" (dict "root" $root "name" $name) | nindent 4 }}
+spec:
+  {{- if not $svc.autoscaling.enabled }}
+  replicas: {{ $svc.replicas }}
+  {{- end }}
+  revisionHistoryLimit: 5
+  strategy:
+    type: RollingUpdate
+    rollingUpdate: { maxSurge: 1, maxUnavailable: 0 }
+  selector:
+    matchLabels:
+      {{- include "caresignal.selectorLabels" (dict "root" $root "name" $name) | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "caresignal.labels" (dict "root" $root "name" $name) | nindent 8 }}
+    spec:
+      automountServiceAccountToken: false     # the apps never call the Kubernetes API
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        seccompProfile: { type: RuntimeDefault }
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              {{- include "caresignal.selectorLabels" (dict "root" $root "name" $name) | nindent 14 }}
+      containers:
+        - name: {{ $name }}
+          image: {{ include "caresignal.image" (dict "root" $root "svc" $svc) | quote }}
+          imagePullPolicy: {{ $root.Values.global.imagePullPolicy }}
+          ports:
+            - name: http
+              containerPort: {{ $svc.port }}
+          env:
+            - name: POD_NAME
+              valueFrom: { fieldRef: { fieldPath: metadata.name } }
+            - name: POD_NAMESPACE
+              valueFrom: { fieldRef: { fieldPath: metadata.namespace } }
+            # ---- OpenTelemetry (read by the Node SDK in src/telemetry.js) ----
+            - name: OTEL_SERVICE_NAME
+              value: {{ $name | quote }}
+            - name: OTEL_RESOURCE_ATTRIBUTES
+              value: "service.namespace=caresignal,service.version={{ $svc.tag }},deployment.environment.name={{ $root.Values.global.environment }},k8s.namespace.name=$(POD_NAMESPACE),k8s.pod.name=$(POD_NAME)"
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              value: {{ $root.Values.otel.endpoint | quote }}
+            - name: OTEL_EXPORTER_OTLP_PROTOCOL
+              value: grpc
+            - name: OTEL_TRACES_EXPORTER
+              value: otlp
+            - name: OTEL_METRICS_EXPORTER
+              value: otlp
+            - name: OTEL_LOGS_EXPORTER          # logs go to stdout (JSON with trace_id); the node collector ships them
+              value: none
+            - name: OTEL_TRACES_SAMPLER
+              value: {{ $root.Values.otel.tracesSampler | quote }}
+            - name: OTEL_TRACES_SAMPLER_ARG
+              value: {{ $root.Values.otel.tracesSamplerArg | quote }}
+            - name: OTEL_SEMCONV_STABILITY_OPT_IN   # stable HTTP metric names (http.server.request.duration, seconds)
+              value: http
+            - name: OTEL_METRIC_EXPORT_INTERVAL
+              value: "15000"
+            {{- range $k, $v := $svc.env }}
+            - name: {{ $k }}
+              value: {{ $v | quote }}
+            {{- end }}
+            {{- range $k, $key := $svc.secretEnv }}
+            - name: {{ $k }}
+              valueFrom:
+                secretKeyRef: { name: {{ $root.Values.appSecret }}, key: {{ $key }} }
+            {{- end }}
+            {{- range $k, $key := $svc.optionalSecretEnv }}
+            - name: {{ $k }}
+              valueFrom:
+                secretKeyRef: { name: {{ $root.Values.appSecret }}, key: {{ $key }}, optional: true }
+            {{- end }}
+            {{- with $svc.database }}
+            - name: DB_HOST
+              value: {{ $root.Values.postgres.clusterName | quote }}
+            - name: DB_NAME
+              value: {{ .name | quote }}
+            - name: DB_SSLMODE
+              value: require
+            - name: DB_USER
+              valueFrom:
+                secretKeyRef: { name: {{ include "caresignal.dbSecret" (dict "root" $root "user" .user) }}, key: username }
+            - name: DB_PASSWORD
+              valueFrom:
+                secretKeyRef: { name: {{ include "caresignal.dbSecret" (dict "root" $root "user" .user) }}, key: password }
+            {{- end }}
+          readinessProbe:
+            httpGet: { path: {{ $svc.probes.readiness }}, port: http }
+            periodSeconds: 10
+            failureThreshold: 3
+          livenessProbe:
+            httpGet: { path: {{ $svc.probes.liveness }}, port: http }
+            initialDelaySeconds: 10
+            periodSeconds: 20
+            failureThreshold: 3
+          resources:
+            {{- toYaml $svc.resources | nindent 12 }}
+          securityContext:
+            {{- include "caresignal.containerSecurity" (dict "readOnly" true) | nindent 12 }}
+          volumeMounts:
+            - { name: tmp, mountPath: /tmp }
+      volumes:
+        - name: tmp
+          emptyDir: { sizeLimit: 64Mi }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "caresignal.labels" (dict "root" $root "name" $name) | nindent 4 }}
+spec:
+  selector:
+    {{- include "caresignal.selectorLabels" (dict "root" $root "name" $name) | nindent 4 }}
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+{{- if $svc.autoscaling.enabled }}
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "caresignal.labels" (dict "root" $root "name" $name) | nindent 4 }}
+spec:
+  scaleTargetRef: { apiVersion: apps/v1, kind: Deployment, name: {{ $name }} }
+  minReplicas: {{ $svc.autoscaling.minReplicas }}
+  maxReplicas: {{ $svc.autoscaling.maxReplicas }}
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target: { type: Utilization, averageUtilization: {{ $svc.autoscaling.targetCPU }} }
+{{- end }}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "caresignal.labels" (dict "root" $root "name" $name) | nindent 4 }}
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      {{- include "caresignal.selectorLabels" (dict "root" $root "name" $name) | nindent 6 }}
+{{- end }}

@@ -1,0 +1,48 @@
+{{- if .Values.ingress.enabled }}
+# One public address per environment:
+#   /v1/readings    -> vitals-ingest (devices)
+#   /internal/*     -> 404 at the load balancer (service-to-service only)
+#   /api/assistant  -> clinical-assistant (LLM features)
+#   /               -> records-api (dashboard and patient record API)
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: caresignal
+  labels:
+    {{- include "caresignal.labels" (dict "root" . "name" "caresignal") | nindent 4 }}
+  annotations:
+    alb.ingress.kubernetes.io/scheme: internet-facing
+    alb.ingress.kubernetes.io/target-type: ip
+    alb.ingress.kubernetes.io/group.name: {{ .Values.ingress.groupName | quote }}
+    alb.ingress.kubernetes.io/listen-ports: '[{"HTTP": 80}, {"HTTPS": 443}]'
+    alb.ingress.kubernetes.io/ssl-redirect: "443"
+    alb.ingress.kubernetes.io/ssl-policy: ELBSecurityPolicy-TLS13-1-2-2021-06
+    alb.ingress.kubernetes.io/healthcheck-path: /healthz
+    alb.ingress.kubernetes.io/load-balancer-attributes: routing.http.drop_invalid_header_fields.enabled=true
+    alb.ingress.kubernetes.io/actions.not-found: >-
+      {"type":"fixed-response","fixedResponseConfig":{"contentType":"text/plain","statusCode":"404","messageBody":"Not found"}}
+    {{- with .Values.ingress.certificateArn }}
+    alb.ingress.kubernetes.io/certificate-arn: {{ . | quote }}
+    {{- end }}
+    external-dns.alpha.kubernetes.io/hostname: {{ .Values.ingress.host | quote }}
+spec:
+  ingressClassName: {{ .Values.ingress.className }}
+  tls:
+    - hosts: [{{ .Values.ingress.host | quote }}]
+  rules:
+    - host: {{ .Values.ingress.host | quote }}
+      http:
+        paths:
+          - path: /internal
+            pathType: Prefix
+            backend: { service: { name: not-found, port: { name: use-annotation } } }
+          - path: /v1/readings
+            pathType: Exact
+            backend: { service: { name: vitals-ingest, port: { name: http } } }
+          - path: /api/assistant
+            pathType: Prefix
+            backend: { service: { name: clinical-assistant, port: { name: http } } }
+          - path: /
+            pathType: Prefix
+            backend: { service: { name: records-api, port: { name: http } } }
+{{- end }}

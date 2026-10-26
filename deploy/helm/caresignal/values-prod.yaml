@@ -1,0 +1,22 @@
+# Prod: Argo CD shows OutOfSync and waits for a person to press Sync.
+# Image tags arrive through the promotion pull request (same images that passed stage).
+global:
+  environment: prod
+  imageRegistry: 127214197057.dkr.ecr.eu-west-2.amazonaws.com
+
+services:
+  vitals-ingest:
+    tag: initial
+  records-api:
+    tag: initial
+  clinical-assistant:
+    tag: initial
+
+otel:
+  tracesSamplerArg: "0.5"
+
+ingress:
+  host: caresignal.mfon21.space
+
+monitoring:
+  grafanaDashboard: true

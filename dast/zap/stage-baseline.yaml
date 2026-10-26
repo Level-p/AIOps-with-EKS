@@ -1,0 +1,85 @@
+# OWASP ZAP Automation Framework plan: BASELINE (passive) scan of the deployed STAGE environment.
+# ZAP crawls the dashboard and calls every API operation once with valid, harmless requests,
+# then inspects the responses: security headers, cookies, CORS, caching of patient data, error
+# pages that leak stack traces, server banners, TLS redirects, mixed content, vulnerable
+# JavaScript libraries. No attack payloads are sent, so it is safe for a shared environment and
+# it tests what the cluster really serves (ALB, WAF, ingress, real configuration).
+#
+# Inputs: TARGET_URL (https://caresignal-stage.<domain>), CLINICIAN_TOKEN, DEVICE_TOKEN, DAST_DIR
+env:
+  contexts:
+    - name: caresignal-stage
+      urls: ["${TARGET_URL}"]
+      includePaths: ["${TARGET_URL}.*"]
+      excludePaths:
+        - ".*/healthz.*"
+        - ".*/readyz.*"
+        # writes: the baseline only reads in a shared environment
+        - ".*/notes.*"
+        - ".*/draft.*"
+  parameters:
+    failOnError: true
+    failOnWarning: false
+    progressToStdout: true
+
+jobs:
+  - type: replacer
+    parameters:
+      deleteAllRules: true
+    rules:
+      - description: clinician bearer token
+        url: ".*/api/.*"
+        matchType: req_header
+        matchString: Authorization
+        matchRegex: false
+        replacementString: "Bearer ${CLINICIAN_TOKEN}"
+      - description: device token
+        url: ".*/v1/readings.*"
+        matchType: req_header
+        matchString: X-Device-Token
+        matchRegex: false
+        replacementString: "${DEVICE_TOKEN}"
+
+  - type: openapi
+    parameters:
+      apiFile: "${DAST_DIR}/openapi/caresignal.generated.yaml"
+      targetUrl: "${TARGET_URL}"
+      context: caresignal-stage
+
+  - type: spider
+    parameters:
+      context: caresignal-stage
+      maxDuration: 2
+      maxDepth: 5
+
+  # The edge must hide service-to-service routes and redirect plain HTTP
+  - type: requestor
+    requests:
+      - url: "${TARGET_URL}/internal/readings"
+        method: POST
+        data: "{}"
+        responseCode: 404
+
+  - type: passiveScan-wait
+    parameters:
+      maxDuration: 10
+
+  - type: report
+    parameters:
+      template: traditional-json
+      reportDir: "${DAST_DIR}/reports"
+      reportFile: zap-report.json
+    risks: [info, low, medium, high]
+  - type: report
+    parameters:
+      template: sarif-json
+      reportDir: "${DAST_DIR}/reports"
+      reportFile: zap-report.sarif.json
+    risks: [low, medium, high]
+  - type: report
+    parameters:
+      template: traditional-html
+      reportDir: "${DAST_DIR}/reports"
+      reportFile: zap-report.html
+      reportTitle: CareSignal DAST (baseline scan, stage)
+    risks: [info, low, medium, high]

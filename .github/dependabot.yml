@@ -1,0 +1,27 @@
+# Dependabot: weekly update PRs for every ecosystem in the repository.
+# Every PR runs the same gates (tests, Semgrep, dependency guard, npm audit, pip-audit, Trivy).
+version: 2
+updates:
+  - package-ecosystem: npm
+    directories: ["/services/vitals-ingest", "/services/records-api", "/services/clinical-assistant"]
+    schedule: { interval: weekly }
+    # Release cooldown: a new version is proposed only once it is 7 days old (most malicious
+    # releases are found and pulled within days); scripts/dependency_guard.py enforces the same
+    cooldown: { default-days: 7 }
+    groups:
+      opentelemetry: { patterns: ["@opentelemetry/*"] }
+  - package-ecosystem: pip
+    directories: ["/services/aiops-engine"]
+    schedule: { interval: weekly }
+    cooldown: { default-days: 7 }
+    groups:
+      opentelemetry: { patterns: ["opentelemetry-*"] }
+  - package-ecosystem: docker
+    directories: ["/services/vitals-ingest", "/services/records-api", "/services/clinical-assistant", "/services/aiops-engine"]
+    schedule: { interval: weekly }
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule: { interval: weekly }
+  - package-ecosystem: terraform
+    directories: ["/terraform", "/terraform/bootstrap"]
+    schedule: { interval: weekly }

@@ -1,0 +1,126 @@
+{{- $labels := dict "app.kubernetes.io/name" "aiops-engine" "app.kubernetes.io/part-of" "caresignal" -}}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: aiops-engine
+  labels: {{- toYaml $labels | nindent 4 }}
+---
+# Read-only evidence: events in the watched namespaces, Argo CD Applications (what was deployed when).
+# No write verbs anywhere: the engine can suggest, never act (OWASP LLM06 excessive agency).
+{{- range .Values.watchNamespaces }}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: aiops-engine-read-events
+  namespace: {{ . }}
+rules:
+  - apiGroups: [""]
+    resources: [events]
+    verbs: [get, list]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: aiops-engine-read-events
+  namespace: {{ . }}
+roleRef: { apiGroup: rbac.authorization.k8s.io, kind: Role, name: aiops-engine-read-events }
+subjects:
+  - { kind: ServiceAccount, name: aiops-engine, namespace: {{ $.Release.Namespace }} }
+---
+{{- end }}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: aiops-engine-read-applications
+  namespace: {{ .Values.argocdNamespace }}
+rules:
+  - apiGroups: [argoproj.io]
+    resources: [applications]
+    verbs: [get, list]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: aiops-engine-read-applications
+  namespace: {{ .Values.argocdNamespace }}
+roleRef: { apiGroup: rbac.authorization.k8s.io, kind: Role, name: aiops-engine-read-applications }
+subjects:
+  - { kind: ServiceAccount, name: aiops-engine, namespace: {{ .Release.Namespace }} }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: aiops-engine
+  labels: {{- toYaml $labels | nindent 4 }}
+spec:
+  replicas: {{ .Values.replicas }}
+  strategy: { type: Recreate }      # never two detectors at once
+  selector:
+    matchLabels: { app.kubernetes.io/name: aiops-engine }
+  template:
+    metadata:
+      labels: {{- toYaml $labels | nindent 8 }}
+    spec:
+      serviceAccountName: aiops-engine
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        seccompProfile: { type: RuntimeDefault }
+      containers:
+        - name: aiops-engine
+          image: "{{ .Values.image.registry }}/{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          ports: [{ name: http, containerPort: 8080 }]
+          env:
+            {{- range $k, $v := .Values.config }}
+            - { name: {{ $k }}, value: {{ $v | quote }} }
+            {{- end }}
+            - name: SLACK_WEBHOOK_URL
+              valueFrom: { secretKeyRef: { name: {{ .Values.secretName }}, key: slack-webhook-url, optional: true } }
+            - name: WEBHOOK_TOKEN
+              valueFrom: { secretKeyRef: { name: {{ .Values.secretName }}, key: webhook-token } }
+            - name: ANTHROPIC_API_KEY
+              valueFrom: { secretKeyRef: { name: {{ .Values.secretName }}, key: anthropic-api-key, optional: true } }
+          readinessProbe: { httpGet: { path: /healthz, port: http }, periodSeconds: 10 }
+          livenessProbe: { httpGet: { path: /healthz, port: http }, periodSeconds: 20, initialDelaySeconds: 10 }
+          resources: {{- toYaml .Values.resources | nindent 12 }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: ["ALL"] }
+          volumeMounts: [{ name: tmp, mountPath: /tmp }]
+      volumes: [{ name: tmp, emptyDir: { sizeLimit: 32Mi } }]
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: aiops-engine
+  labels: {{- toYaml $labels | nindent 4 }}
+spec:
+  selector: { app.kubernetes.io/name: aiops-engine }
+  ports: [{ name: http, port: 8080, targetPort: http }]
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: aiops-engine
+  labels: {{- toYaml $labels | nindent 4 }}
+spec:
+  selector:
+    matchLabels: { app.kubernetes.io/name: aiops-engine }
+  endpoints: [{ port: http, path: /metrics, interval: 30s }]
+---
+# Only Alertmanager and Prometheus (monitoring namespace) may call the engine
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: aiops-engine
+spec:
+  podSelector:
+    matchLabels: { app.kubernetes.io/name: aiops-engine }
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels: { kubernetes.io/metadata.name: monitoring }
+      ports: [{ port: 8080, protocol: TCP }]

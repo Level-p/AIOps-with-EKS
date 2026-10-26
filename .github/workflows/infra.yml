@@ -1,0 +1,237 @@
+# ---------------------------------------------------------------------------
+# CareSignal infrastructure: Terraform for VPC, EKS, ECR, add-ons, Prometheus,
+# Grafana, OpenTelemetry collectors, Loki, Tempo, Kyverno, the postgres-operator, the stage/prod
+# and aiops namespaces, the backup bucket and Argo CD (folder: terraform/).
+#
+# Push to main  -> scan, plan, apply (apply waits for "infrastructure" approval)
+# Pull request  -> scan and plan only
+# Manual run    -> choose plan, apply or destroy
+#
+# Required repository secret:  AWS_ROLE_ARN   (bootstrap output github_actions_role_arn)
+# Optional repository secret:  GIT_REPO_TOKEN (read-only token, only for a PRIVATE repo,
+#                                              so Argo CD can read it)
+# Optional repository secret:  ALERT_SLACK_WEBHOOK_URL (Slack incoming webhook: Alertmanager
+#                                              posts alerts there; without it they stay in Grafana)
+# Optional repository secret:  ANTHROPIC_API_KEY (Claude API key for aiops-engine's AI-assisted
+#                                              triage; without it the engine uses rule-based triage)
+# Optional repository secret:  ASSISTANT_ANTHROPIC_API_KEY (key of the clinical assistant, ideally
+#                                              from its own workspace; empty = ANTHROPIC_API_KEY)
+# GitHub environment:          "infrastructure" with required reviewers
+# ---------------------------------------------------------------------------
+name: CareSignal Infrastructure
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "terraform/**"
+      - ".github/workflows/infra.yml"
+  pull_request:
+    paths:
+      - "terraform/**"
+      - ".github/workflows/infra.yml"
+  workflow_dispatch:
+    inputs:
+      action:
+        description: "Terraform action"
+        type: choice
+        options: [plan, apply, destroy]
+        default: plan
+
+permissions:
+  id-token: write   # GitHub OIDC -> AWS
+  contents: read
+
+concurrency:
+  group: caresignal-infra
+  cancel-in-progress: false   # never cancel a running apply
+
+env:
+  AWS_REGION: eu-west-2
+  TF_DIR: terraform
+  TF_VERSION: 1.15.6
+  CLUSTER_NAME: caresignal-eks
+  TF_VAR_git_repo_token: ${{ secrets.GIT_REPO_TOKEN }}
+  TF_VAR_alert_slack_webhook_url: ${{ secrets.ALERT_SLACK_WEBHOOK_URL }}
+  TF_VAR_anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+  TF_VAR_assistant_anthropic_api_key: ${{ secrets.ASSISTANT_ANTHROPIC_API_KEY }}
+  TF_IN_AUTOMATION: "true"
+
+jobs:
+  iac-scan:
+    name: Checkov IaC scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Checkov (report only)
+        uses: bridgecrewio/checkov-action@99bb2caf247dfd9f03cf984373bc6043d4e32ebf # v12.1347.0
+        with:
+          directory: ${{ env.TF_DIR }}
+          framework: terraform
+          soft_fail: true          # report findings without failing the build
+          output_format: cli
+
+  plan:
+    name: Terraform plan
+    needs: iac-scan
+    if: github.event_name != 'workflow_dispatch' || inputs.action != 'destroy'
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ${{ env.TF_DIR }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # An empty secret makes the next step fail with the vague
+      # "Could not load credentials from any providers"
+      - name: Check the AWS_ROLE_ARN secret
+        env:
+          ROLE_ARN: ${{ secrets.AWS_ROLE_ARN }}
+        run: |
+          if [ -z "$ROLE_ARN" ]; then
+            echo "::error::Secret AWS_ROLE_ARN is empty. Add it under Settings > Secrets and variables > Actions > Repository secrets (value: terraform -chdir=terraform/bootstrap output -raw github_actions_role_arn)."
+            exit 1
+          fi
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: Terraform init
+        run: terraform init -input=false
+
+      - name: Terraform fmt
+        run: terraform fmt -check -recursive
+
+      - name: Terraform validate
+        run: terraform validate
+
+      - name: Terraform plan
+        run: terraform plan -input=false -out=tfplan
+
+      - name: Upload plan
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: tfplan
+          path: ${{ env.TF_DIR }}/tfplan
+          retention-days: 5
+
+  apply:
+    name: Terraform apply
+    needs: plan
+    if: >-
+      (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
+      (github.event_name == 'workflow_dispatch' && inputs.action == 'apply')
+    runs-on: ubuntu-latest
+    environment: infrastructure   # add required reviewers in Settings > Environments
+    defaults:
+      run:
+        working-directory: ${{ env.TF_DIR }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-duration-seconds: 7200   # the first apply takes 30-35 minutes
+
+      - uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: Download plan
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: tfplan
+          path: ${{ env.TF_DIR }}
+
+      - name: Terraform init
+        run: terraform init -input=false
+
+      - name: Terraform apply
+        run: terraform apply -input=false tfplan
+
+      - name: Show outputs
+        run: terraform output
+
+  destroy:
+    name: Terraform destroy
+    if: github.event_name == 'workflow_dispatch' && inputs.action == 'destroy'
+    needs: iac-scan
+    runs-on: ubuntu-latest
+    environment: infrastructure
+    defaults:
+      run:
+        working-directory: ${{ env.TF_DIR }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Check the AWS_ROLE_ARN secret
+        env:
+          ROLE_ARN: ${{ secrets.AWS_ROLE_ARN }}
+        run: |
+          if [ -z "$ROLE_ARN" ]; then
+            echo "::error::Secret AWS_ROLE_ARN is empty. Add it under Settings > Secrets and variables > Actions > Repository secrets."
+            exit 1
+          fi
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-duration-seconds: 7200
+
+      - uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      # Every ALB is created by the load balancer controller from an Ingress, so
+      # Terraform does not know about them. Delete them all here, while the
+      # controller can still reach AWS: once Terraform removes the NAT gateway
+      # the controller is cut off, the ALBs stay, and their public IPs block the
+      # subnet and internet gateway deletion (DependencyViolation).
+      # The database is marked "never delete" for Argo CD
+      # (Delete=false), so they are removed here on purpose, with their disks.
+      - name: Remove CareSignal, its databases and every load balancer
+        continue-on-error: true
+        run: |
+          aws eks update-kubeconfig --name "$CLUSTER_NAME" --region "$AWS_REGION" || exit 0
+          kubectl delete applications.argoproj.io --all -n argocd --wait=true --timeout=10m || true
+          for ns in caresignal-stage caresignal-prod; do
+            kubectl delete postgresql --all -n "$ns" --wait=true --timeout=5m || true
+            kubectl delete statefulset --all -n "$ns" --wait=true --timeout=5m || true
+            kubectl delete pvc --all -n "$ns" --wait=false || true
+          done
+          # Argo CD and Grafana share the "caresignal-tools" ALB
+          kubectl delete ingress --all -A --wait=true --timeout=5m || true
+          kubectl get svc -A --no-headers | awk '$3=="LoadBalancer"{print $1" "$2}' | while read -r ns name; do
+            kubectl delete svc "$name" -n "$ns" --wait=true --timeout=5m || true
+          done
+          kubectl delete pvc --all -n monitoring --wait=false || true
+
+          VPC=$(aws eks describe-cluster --name "$CLUSTER_NAME" --query cluster.resourcesVpcConfig.vpcId --output text)
+          for i in $(seq 1 30); do
+            LEFT=$(aws elbv2 describe-load-balancers --query "length(LoadBalancers[?VpcId=='$VPC'])" --output text)
+            [ "$LEFT" = "0" ] && { echo "All load balancers deleted"; exit 0; }
+            echo "Waiting for $LEFT load balancer(s) to be deleted..."; sleep 10
+          done
+          echo "::warning::Load balancers still exist in $VPC; the VPC deletion may fail. Delete them in the EC2 console and run destroy again."
+
+      - name: Terraform init
+        run: terraform init -input=false
+
+      - name: Terraform destroy
+        run: terraform destroy -input=false -auto-approve

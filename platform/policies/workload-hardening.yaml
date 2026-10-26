@@ -1,0 +1,86 @@
+# Baseline for every workload in the CareSignal namespaces (in addition to the
+# namespaces' "restricted" Pod Security Standard labels). Enforced: a violating
+# Deployment is refused by the API server, and Argo CD shows the sync error.
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: caresignal-workload-hardening
+  annotations:
+    policies.kyverno.io/title: CareSignal workload hardening
+    policies.kyverno.io/category: Pod security
+spec:
+  background: true
+  rules:
+    - name: allowed-registries
+      match:
+        any:
+          - resources: { kinds: [Pod], namespaces: [caresignal-stage, caresignal-prod, aiops] }
+      validate:
+        failureAction: Enforce
+        message: "Images must come from the CareSignal ECR registry or the approved public images (PostgreSQL/Spilo, AWS CLI)."
+        foreach:
+          - list: "request.object.spec.[containers, initContainers, ephemeralContainers][]"
+            deny:
+              conditions:
+                all:
+                  - key: "{{ element.image }}"
+                    operator: AnyNotIn
+                    value:
+                      - "127214197057.dkr.ecr.eu-west-2.amazonaws.com/caresignal/*"
+                      - "ghcr.io/zalando/spilo-*"
+                      - "postgres:*"
+                      - "public.ecr.aws/aws-cli/aws-cli:*"
+    - name: no-latest-tag
+      match:
+        any:
+          - resources: { kinds: [Pod], namespaces: [caresignal-stage, caresignal-prod, aiops] }
+      validate:
+        failureAction: Enforce
+        message: "Use an immutable tag or digest, never ':latest' or no tag."
+        foreach:
+          - list: "request.object.spec.[containers, initContainers][]"
+            deny:
+              conditions:
+                any:
+                  - key: "{{ element.image }}"
+                    operator: Equals
+                    value: "*:latest"
+                  - key: "{{ contains(element.image, ':') || contains(element.image, '@') }}"
+                    operator: Equals
+                    value: false
+    - name: requests-and-memory-limits
+      match:
+        any:
+          - resources: { kinds: [Pod], namespaces: [caresignal-stage, caresignal-prod, aiops] }
+      exclude:
+        any:
+          - resources:
+              selector:
+                matchLabels: { application: spilo }   # sized by the postgres-operator from the postgresql resource
+      validate:
+        failureAction: Enforce
+        message: "Every container needs CPU and memory requests and a memory limit."
+        pattern:
+          spec:
+            containers:
+              - resources:
+                  requests: { cpu: "?*", memory: "?*" }
+                  limits: { memory: "?*" }
+    - name: read-only-root-and-no-escalation
+      match:
+        any:
+          - resources: { kinds: [Pod], namespaces: [caresignal-stage, caresignal-prod, aiops] }
+      exclude:
+        any:
+          - resources:
+              selector:
+                matchLabels: { application: spilo }
+      validate:
+        failureAction: Enforce
+        message: "Containers must run with a read-only root filesystem and without privilege escalation."
+        pattern:
+          spec:
+            containers:
+              - securityContext:
+                  readOnlyRootFilesystem: true
+                  allowPrivilegeEscalation: false

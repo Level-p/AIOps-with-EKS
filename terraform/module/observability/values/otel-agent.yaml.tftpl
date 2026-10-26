@@ -1,0 +1,40 @@
+# OpenTelemetry agent (DaemonSet): reads every container's stdout on its node and forwards it.
+mode: daemonset
+image:
+  repository: otel/opentelemetry-collector-contrib
+tolerations:
+  - operator: Exists                  # every node
+presets:
+  logsCollection:
+    enabled: true                     # filelog receiver on /var/log/pods (namespace, pod, container from the path)
+  kubernetesAttributes:
+    enabled: true
+resources:
+  requests: { cpu: 50m, memory: 128Mi }
+  limits: { memory: 384Mi }
+ports:
+  jaeger-compact: { enabled: false }
+  jaeger-thrift: { enabled: false }
+  jaeger-grpc: { enabled: false }
+  zipkin: { enabled: false }
+  otlp: { enabled: false }
+  otlp-http: { enabled: false }
+alternateConfig:
+  extensions:
+    health_check:
+      endpoint: $${env:MY_POD_IP}:13133
+  receivers: {}
+  processors:
+    memory_limiter: { check_interval: 5s, limit_percentage: 80, spike_limit_percentage: 25 }
+    batch: {}
+  exporters:
+    otlp/gateway:
+      endpoint: ${gateway_endpoint}
+      tls: { insecure: true }
+  service:
+    extensions: [health_check]
+    pipelines:
+      logs:
+        receivers: []
+        processors: [memory_limiter, batch]
+        exporters: [otlp/gateway]

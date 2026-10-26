@@ -1,0 +1,136 @@
+{{- if .Values.monitoring.prometheusRule }}
+{{- $ns := .Release.Namespace }}
+# Alerts on the OpenTelemetry metrics (after the collector's remote-write conversion:
+# http.server.request.duration -> http_server_request_duration_seconds_*, resource
+# attributes -> labels such as k8s_namespace_name and service_name).
+# Alertmanager sends every alert to Slack and to aiops-engine, which adds evidence and
+# an AI-assisted triage. The "query" annotation tells aiops-engine what to look at.
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: caresignal
+  labels:
+    {{- include "caresignal.labels" (dict "root" . "name" "caresignal") | nindent 4 }}
+spec:
+  groups:
+    - name: caresignal.slo
+      rules:
+        - alert: CareSignalHighErrorRate
+          expr: |
+            sum by (service_name) (rate(http_server_request_duration_seconds_count{k8s_namespace_name="{{ $ns }}", http_response_status_code=~"5.."}[5m]))
+              / clamp_min(sum by (service_name) (rate(http_server_request_duration_seconds_count{k8s_namespace_name="{{ $ns }}"}[5m])), 1e-6) > 0.05
+          for: 5m
+          labels: { severity: critical, namespace: {{ $ns }} }
+          annotations:
+            summary: "{{`{{ $labels.service_name }}`}}: more than 5% of requests fail (5xx)"
+            query: sum by (service_name, http_route) (rate(http_server_request_duration_seconds_count{k8s_namespace_name="{{ $ns }}", http_response_status_code=~"5.."}[5m]))
+            runbook: error-rate
+        - alert: CareSignalHighLatency
+          expr: |
+            histogram_quantile(0.95, sum by (le, service_name) (rate(http_server_request_duration_seconds_bucket{k8s_namespace_name="{{ $ns }}"}[5m]))) > 1
+          for: 10m
+          labels: { severity: warning, namespace: {{ $ns }} }
+          annotations:
+            summary: "{{`{{ $labels.service_name }}`}}: p95 latency above 1 s"
+            query: histogram_quantile(0.95, sum by (le, service_name, http_route) (rate(http_server_request_duration_seconds_bucket{k8s_namespace_name="{{ $ns }}"}[5m])))
+            runbook: latency
+        - alert: CareSignalReadingsNotStored
+          expr: sum(increase(caresignal_vitals_forward_failures_total{k8s_namespace_name="{{ $ns }}"}[5m])) > 0
+          for: 2m
+          labels: { severity: critical, namespace: {{ $ns }} }
+          annotations:
+            summary: "Readings accepted from devices could not be stored (records-api or database)"
+            query: sum(increase(caresignal_vitals_forward_failures_total{k8s_namespace_name="{{ $ns }}"}[5m]))
+            runbook: database
+        - alert: CareSignalIngestStopped
+          expr: sum(rate(caresignal_vitals_ingested_total{k8s_namespace_name="{{ $ns }}"}[10m])) == 0
+          for: 10m
+          labels: { severity: warning, namespace: {{ $ns }} }
+          annotations:
+            summary: "No device readings for 10 minutes"
+            query: sum by (risk) (rate(caresignal_vitals_ingested_total{k8s_namespace_name="{{ $ns }}"}[30m]))
+            runbook: ingest-down
+        - alert: CareSignalDeviceAuthFailures
+          expr: sum(rate(caresignal_vitals_rejected_total{k8s_namespace_name="{{ $ns }}", reason="unauthenticated"}[5m])) > 1
+          for: 5m
+          labels: { severity: warning, namespace: {{ $ns }} }
+          annotations:
+            summary: "Many readings with an invalid device token (misconfigured devices or an attack)"
+            query: sum(rate(caresignal_vitals_rejected_total{k8s_namespace_name="{{ $ns }}"}[5m]))
+            runbook: ingest-down
+    # LLM operations: the clinical assistant (caresignal.llm.* metrics of clinical-assistant)
+    - name: caresignal.llm
+      rules:
+        - alert: CareSignalAssistantDegraded
+          expr: |
+            sum(rate(caresignal_llm_requests_total{k8s_namespace_name="{{ $ns }}", outcome=~"error|fallback"}[10m]))
+              / clamp_min(sum(rate(caresignal_llm_requests_total{k8s_namespace_name="{{ $ns }}"}[10m])), 1e-6) > 0.25
+          for: 10m
+          labels: { severity: warning, namespace: {{ $ns }} }
+          annotations:
+            summary: "More than 25% of assistant requests fail or fall back to the rule-based summary"
+            query: sum by (feature, outcome) (rate(caresignal_llm_requests_total{k8s_namespace_name="{{ $ns }}"}[10m]))
+            runbook: llm-provider
+        - alert: CareSignalAssistantCircuitOpen
+          expr: max(caresignal_llm_circuit_open_ratio{k8s_namespace_name="{{ $ns }}"}) > 0
+          for: 5m
+          labels: { severity: warning, namespace: {{ $ns }} }
+          annotations:
+            summary: "The model circuit breaker is open: the provider keeps failing"
+            query: sum by (feature, outcome) (rate(caresignal_llm_requests_total{k8s_namespace_name="{{ $ns }}"}[15m]))
+            runbook: llm-provider
+        - alert: CareSignalPromptInjectionAttempts
+          expr: sum(increase(caresignal_llm_guardrail_blocks_total{k8s_namespace_name="{{ $ns }}", reason="prompt_injection"}[15m])) > 5
+          labels: { severity: warning, namespace: {{ $ns }}, team: security }
+          annotations:
+            summary: "Repeated prompt-injection attempts against the clinical assistant (misuse of a clinician credential?)"
+            query: sum by (reason) (increase(caresignal_llm_guardrail_blocks_total{k8s_namespace_name="{{ $ns }}"}[1h]))
+            runbook: llm-abuse
+        - alert: CareSignalAssistantUngrounded
+          expr: sum(increase(caresignal_llm_grounding_failures_total{k8s_namespace_name="{{ $ns }}"}[30m])) > 10
+          labels: { severity: warning, namespace: {{ $ns }} }
+          annotations:
+            summary: "Many assistant statements had no support in the record (model, prompt or record-format regression)"
+            query: sum by (feature) (increase(caresignal_llm_grounding_failures_total{k8s_namespace_name="{{ $ns }}"}[1h]))
+            runbook: llm-quality
+        - alert: CareSignalTokenBudgetLow
+          expr: min(caresignal_llm_budget_remaining_ratio{k8s_namespace_name="{{ $ns }}"}) < 0.2
+          for: 5m
+          labels: { severity: warning, namespace: {{ $ns }} }
+          annotations:
+            summary: "A clinical-assistant pod has used more than 80% of today's token budget"
+            query: sum by (feature, direction) (rate(caresignal_llm_tokens_total{k8s_namespace_name="{{ $ns }}"}[1h])) * 3600
+            runbook: llm-cost
+        - alert: CareSignalAssistantSlow
+          expr: |
+            histogram_quantile(0.95, sum by (le, feature) (rate(caresignal_llm_duration_seconds_bucket{k8s_namespace_name="{{ $ns }}"}[15m]))) > 30
+          for: 15m
+          labels: { severity: warning, namespace: {{ $ns }} }
+          annotations:
+            summary: "{{`{{ $labels.feature }}`}}: p95 model latency above 30 s"
+            query: histogram_quantile(0.95, sum by (le, feature) (rate(caresignal_llm_duration_seconds_bucket{k8s_namespace_name="{{ $ns }}"}[15m])))
+            runbook: llm-provider
+    - name: caresignal.platform
+      rules:
+        - alert: CareSignalPodCrashLooping
+          expr: increase(kube_pod_container_status_restarts_total{namespace="{{ $ns }}"}[15m]) > 3
+          labels: { severity: warning, namespace: {{ $ns }} }
+          annotations:
+            summary: "{{`{{ $labels.pod }}`}} restarted more than 3 times in 15 minutes"
+            runbook: pod-crashloop
+        - alert: CareSignalDatabaseDegraded
+          expr: |
+            kube_statefulset_status_replicas_ready{namespace="{{ $ns }}", statefulset="{{ .Values.postgres.clusterName }}"}
+              < kube_statefulset_replicas{namespace="{{ $ns }}", statefulset="{{ .Values.postgres.clusterName }}"}
+          for: 5m
+          labels: { severity: critical, namespace: {{ $ns }} }
+          annotations:
+            summary: "PostgreSQL cluster has fewer ready members than configured"
+            runbook: database
+        - alert: CareSignalBackupFailed
+          expr: kube_job_status_failed{namespace="{{ $ns }}", job_name=~"caresignal-db-backup.*"} > 0
+          labels: { severity: warning, namespace: {{ $ns }} }
+          annotations:
+            summary: "The nightly database backup failed"
+            runbook: database
+{{- end }}

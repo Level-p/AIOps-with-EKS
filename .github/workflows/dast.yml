@@ -1,0 +1,200 @@
+# ---------------------------------------------------------------------------
+# DAST: OWASP ZAP against the RUNNING application (what SAST cannot see: real headers, real
+# authentication, real routing, real error pages, injection reaching the real database).
+#
+#   ephemeral   every pull request and push to main: the whole CareSignal stack starts INSIDE
+#               this job (PostgreSQL service container, the three Node.js services, and a gateway
+#               that mirrors the ALB ingress). ZAP imports the OpenAPI contract, crawls the
+#               dashboard, then runs a FULL scan (passive + active attacks), authenticated.
+#               Safe: synthetic data, thrown away when the job ends.          (blocking)
+#   stage       nightly, on demand, and before every promotion (promote.yml calls it): a
+#               BASELINE scan (passive, read-only operations) of the deployed stage behind the
+#               real ALB/WAF. No attack payloads in a shared environment.   (blocking)
+#
+# Gate: dast/zap_gate.py. Medium or High findings fail unless dast/zap-policy.json holds a
+# reviewed exception with an owner and an expiry date. SARIF goes to the Security tab.
+# Stage needs environment secrets STAGE_CLINICIAN_TOKEN and STAGE_DEVICE_TOKEN (environment "stage").
+# ---------------------------------------------------------------------------
+name: DAST (OWASP ZAP)
+
+on:
+  pull_request:
+    paths:
+      - "services/vitals-ingest/**"
+      - "services/records-api/**"
+      - "services/clinical-assistant/**"
+      - "dast/**"
+      - ".github/workflows/dast.yml"
+  push:
+    branches: [main]
+    paths:
+      - "services/vitals-ingest/**"
+      - "services/records-api/**"
+      - "services/clinical-assistant/**"
+      - "dast/**"
+      - ".github/workflows/dast.yml"
+  schedule:
+    - cron: "41 2 * * *"   # nightly baseline of stage: configuration drifts, new passive rules
+  workflow_dispatch:
+    inputs:
+      target:
+        description: What to scan
+        type: choice
+        options: [ephemeral, stage]
+        default: ephemeral
+  workflow_call:          # promote.yml: scan stage before anything is copied to prod
+    inputs:
+      target:
+        type: string
+        default: stage
+
+permissions:
+  contents: read
+
+concurrency:
+  group: dast-${{ github.ref }}-${{ inputs.target || github.event_name }}
+  cancel-in-progress: true
+
+jobs:
+  ephemeral:
+    name: ZAP full scan (ephemeral stack)
+    if: github.event_name == 'pull_request' || github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.target == 'ephemeral')
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      security-events: write   # SARIF upload
+    services:
+      postgres:
+        image: postgres:17-alpine@sha256:b0f9560a2de083e2cc7382e75f808c7381a32852a7ec49117deedb300e552b24
+        env:
+          POSTGRES_USER: caresignal
+          POSTGRES_PASSWORD: dast-only-password
+          POSTGRES_DB: caresignal
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U caresignal" --health-interval 5s --health-timeout 5s --health-retries 20
+    env:
+      # Throwaway credentials for a stack that lives only inside this job
+      CLINICIAN_TOKEN: dast-clinician-${{ github.run_id }}
+      DEVICE_TOKEN: dast-device-${{ github.run_id }}
+      INTERNAL_TOKEN: dast-internal-${{ github.run_id }}
+      DB_HOST: 127.0.0.1
+      DB_USER: caresignal
+      DB_PASSWORD: dast-only-password
+      DB_NAME: caresignal
+      DB_SSLMODE: disable
+      OTEL_SDK_DISABLED: "true"
+      RECORDS_API_URL: http://127.0.0.1:8083
+      RATE_LIMIT_PER_MINUTE: "100000"   # the scan sends thousands of requests; the limit has its own unit test
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "24"
+
+      - name: Install (lockfile, integrity-verified, no scripts, production only)
+        run: |
+          for s in records-api vitals-ingest clinical-assistant; do
+            (cd "services/$s" && npm ci --omit=dev --ignore-scripts --no-fund)
+          done
+
+      # No ANTHROPIC_API_KEY: the assistant runs its deterministic fallback, so the scan tests
+      # the guardrails and the HTTP layer without spending tokens or sending data to a provider
+      - name: Start CareSignal (records-api, vitals-ingest, clinical-assistant, gateway)
+        run: |
+          mkdir -p /tmp/dast-logs
+          PORT=8083 nohup node services/records-api/src/server.js        > /tmp/dast-logs/records-api.log 2>&1 &
+          PORT=8081 nohup node services/vitals-ingest/src/server.js      > /tmp/dast-logs/vitals-ingest.log 2>&1 &
+          PORT=8082 nohup node services/clinical-assistant/src/server.js > /tmp/dast-logs/clinical-assistant.log 2>&1 &
+          nohup node dast/gateway.js > /tmp/dast-logs/gateway.log 2>&1 &
+          for i in $(seq 1 60); do
+            curl -fsS http://127.0.0.1:8083/readyz > /dev/null && curl -fsS http://127.0.0.1:8080/healthz > /dev/null \
+              && curl -fsS http://127.0.0.1:8081/healthz > /dev/null && curl -fsS http://127.0.0.1:8082/healthz > /dev/null && break
+            sleep 2
+          done
+          curl -fsS http://127.0.0.1:8083/readyz
+
+      - name: Seed a synthetic patient for the path parameters
+        id: seed
+        run: |
+          ID=$(curl -fsS -X POST http://127.0.0.1:8080/api/patients \
+            -H "Authorization: Bearer $CLINICIAN_TOKEN" -H "Content-Type: application/json" \
+            -d '{"pseudonym":"DAST probe","ward":"DAST","age_band":"40-64","sex":"unknown"}' | jq -r .id)
+          echo "patient=$ID" >> "$GITHUB_OUTPUT"
+
+      - name: OWASP ZAP full scan + gate
+        run: bash dast/run-zap.sh ci-full http://localhost:8080 "${{ steps.seed.outputs.patient }}"
+
+      # A 500 during the scan is a bug even when ZAP raises no alert for it
+      - name: No unhandled errors in the service logs
+        if: always()
+        run: |
+          if grep -h '"level":"error"' /tmp/dast-logs/*.log | grep -v 'database not reachable' ; then
+            echo "::error::The services logged errors while being scanned (see above)."; exit 1
+          fi
+
+      - name: Upload SARIF to code scanning
+        if: always() && hashFiles('dast/reports/zap-report.sarif.json') != ''
+        uses: github/codeql-action/upload-sarif@6f2ac81f5cd81fe351a197ba0b00d91d03cd2aee # v4
+        with:
+          sarif_file: dast/reports/zap-report.sarif.json
+          category: dast-zap-ephemeral
+      - name: Keep the reports and logs
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: zap-ephemeral-${{ github.run_id }}
+          path: |
+            dast/reports/
+            /tmp/dast-logs/
+          retention-days: 30
+
+  stage:
+    name: ZAP baseline scan (stage)
+    if: github.event_name == 'schedule' || inputs.target == 'stage'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment:
+      name: stage
+      url: https://caresignal-stage.${{ vars.DOMAIN_NAME || 'mfon21.space' }}
+    permissions:
+      contents: read
+      security-events: write
+    env:
+      TARGET_URL: https://caresignal-stage.${{ vars.DOMAIN_NAME || 'mfon21.space' }}
+      CLINICIAN_TOKEN: ${{ secrets.STAGE_CLINICIAN_TOKEN }}
+      DEVICE_TOKEN: ${{ secrets.STAGE_DEVICE_TOKEN }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Check the inputs
+        run: |
+          if [ -z "$CLINICIAN_TOKEN" ] || [ -z "$DEVICE_TOKEN" ]; then
+            echo "::error::Add STAGE_CLINICIAN_TOKEN and STAGE_DEVICE_TOKEN to the 'stage' environment (values: the caresignal-app-secrets in AWS Secrets Manager)."; exit 1
+          fi
+          curl -fsS --max-time 10 "$TARGET_URL/healthz" > /dev/null || { echo "::error::$TARGET_URL is not reachable"; exit 1; }
+      - name: Pick an existing synthetic patient (read-only scan)
+        id: seed
+        run: |
+          ID=$(curl -fsS "$TARGET_URL/api/patients" -H "Authorization: Bearer $CLINICIAN_TOKEN" | jq -r '.patients[0].id // empty')
+          if [ -z "$ID" ]; then echo "::error::Stage has no patients; seed it with scripts/simulate_devices.py first."; exit 1; fi
+          echo "patient=$ID" >> "$GITHUB_OUTPUT"
+      - name: OWASP ZAP baseline scan + gate
+        run: bash dast/run-zap.sh stage-baseline "$TARGET_URL" "${{ steps.seed.outputs.patient }}"
+      - name: Upload SARIF to code scanning
+        if: always() && hashFiles('dast/reports/zap-report.sarif.json') != ''
+        uses: github/codeql-action/upload-sarif@6f2ac81f5cd81fe351a197ba0b00d91d03cd2aee # v4
+        with:
+          sarif_file: dast/reports/zap-report.sarif.json
+          category: dast-zap-stage
+      - name: Keep the reports
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: zap-stage-${{ github.run_id }}
+          path: dast/reports/
+          retention-days: 30

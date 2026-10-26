@@ -1,0 +1,47 @@
+# ---------------------------------------------------------------------------
+# AI-assisted development governance (pull requests)
+#
+#   disclosure   AI co-authored commits need the "ai-assisted" label and the ticked
+#                disclosure box; label and box must agree       (scripts/ai_provenance.py)
+#   tests        AI-assisted changes to service code must change tests too
+#   strict-sast  on AI-assisted PRs, EVERY finding of our AI-code rules blocks
+#                (warnings included), not only errors
+# A CODEOWNERS review is required for every PR by branch protection; for
+# AI-assisted PRs it is the human check the policy relies on.
+# ---------------------------------------------------------------------------
+name: AI Governance
+
+on:
+  pull_request:
+    types: [opened, edited, synchronize, reopened, labeled, unlabeled]
+
+permissions:
+  contents: read
+
+jobs:
+  disclosure:
+    name: AI disclosure and tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+      - name: Check the AI-assisted development policy
+        run: python scripts/ai_provenance.py
+
+  strict-sast:
+    name: Strict AI-code rules (ai-assisted PRs)
+    if: contains(github.event.pull_request.labels.*.name, 'ai-assisted')
+    runs-on: ubuntu-latest
+    container:
+      image: semgrep/semgrep:1.181.0
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: AI-code rules, warnings included, block the merge
+        run: semgrep scan --metrics=off --config .semgrep/ai-code-rules.yml --exclude .semgrep --exclude node_modules --error --text

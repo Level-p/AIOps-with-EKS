@@ -1,0 +1,87 @@
+# OpenTelemetry gateway (Deployment): the policy point for all application telemetry.
+mode: deployment
+replicaCount: 1                       # tail sampling needs every span of a trace on the same collector
+image:
+  repository: otel/opentelemetry-collector-contrib
+presets:
+  kubernetesAttributes:
+    enabled: true                     # k8s.deployment.name, k8s.node.name... looked up from the sender's pod IP
+resources:
+  requests: { cpu: 100m, memory: 256Mi }
+  limits: { memory: 512Mi }
+ports:
+  jaeger-compact: { enabled: false }
+  jaeger-thrift: { enabled: false }
+  jaeger-grpc: { enabled: false }
+  zipkin: { enabled: false }
+serviceMonitor:
+  enabled: true
+  metricsEndpoints:
+    - port: metrics
+alternateConfig:
+  extensions:
+    health_check:
+      endpoint: $${env:MY_POD_IP}:13133
+  receivers:
+    otlp:
+      protocols:
+        grpc: { endpoint: "$${env:MY_POD_IP}:4317" }
+        http: { endpoint: "$${env:MY_POD_IP}:4318" }
+  processors:
+    memory_limiter: { check_interval: 5s, limit_percentage: 80, spike_limit_percentage: 25 }
+    batch: {}
+    # HealthTech rule: no patient identifiers in traces
+    transform/redact:
+      error_mode: ignore
+      trace_statements:
+        - context: span
+          statements:
+            - replace_pattern(attributes["url.path"], "${uuid_pattern}", "{id}")
+            - replace_pattern(attributes["http.target"], "${uuid_pattern}", "{id}")
+            - replace_pattern(name, "${uuid_pattern}", "{id}")
+            - delete_key(attributes, "url.query")
+            - delete_key(attributes, "http.request.header.authorization")
+            - delete_key(attributes, "db.statement")
+    # Resource attributes become Prometheus labels: drop the high-cardinality ones
+    resource/trim:
+      attributes:
+%{ for k in drop_attributes ~}
+        - { key: ${k}, action: delete }
+%{ endfor ~}
+    # Keep every error and every slow trace, 10 % of the rest
+    tail_sampling:
+      decision_wait: 10s
+      policies:
+        - { name: errors, type: status_code, status_code: { status_codes: [ERROR] } }
+        - { name: slow, type: latency, latency: { threshold_ms: 500 } }
+        - { name: sample, type: probabilistic, probabilistic: { sampling_percentage: 10 } }
+  exporters:
+    otlp/tempo:
+      endpoint: tempo.${namespace}.svc:4317
+      tls: { insecure: true }
+    otlphttp/loki:
+      endpoint: http://loki.${namespace}.svc:3100/otlp
+    prometheusremotewrite:
+      endpoint: ${prometheus_url}/api/v1/write
+      resource_to_telemetry_conversion: { enabled: true }
+  service:
+    extensions: [health_check]
+    telemetry:
+      metrics:
+        readers:
+          - pull:
+              exporter:
+                prometheus: { host: "$${env:MY_POD_IP}", port: 8888 }
+    pipelines:
+      traces:
+        receivers: [otlp]
+        processors: [memory_limiter, transform/redact, tail_sampling, batch]
+        exporters: [otlp/tempo]
+      metrics:
+        receivers: [otlp]
+        processors: [memory_limiter, resource/trim, batch]
+        exporters: [prometheusremotewrite]
+      logs:
+        receivers: [otlp]
+        processors: [memory_limiter, batch]
+        exporters: [otlphttp/loki]

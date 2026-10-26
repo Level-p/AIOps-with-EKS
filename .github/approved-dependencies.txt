@@ -1,0 +1,30 @@
+# Direct dependencies approved for CareSignal (scripts/dependency_guard.py), npm and PyPI.
+# Adding a line here is a reviewed decision: who maintains it, licence, why we need it.
+
+# ---- npm (vitals-ingest, records-api, clinical-assistant) ----
+@anthropic-ai/sdk
+@opentelemetry/api
+@opentelemetry/auto-instrumentations-node
+@opentelemetry/exporter-metrics-otlp-grpc
+@opentelemetry/exporter-trace-otlp-grpc
+@opentelemetry/sdk-metrics
+@opentelemetry/sdk-node
+express
+express-rate-limit
+helmet
+pg
+pino
+zod
+# test only
+pg-mem
+supertest
+
+# ---- PyPI (aiops-engine) ----
+anthropic
+fastapi
+httpx
+opentelemetry-api
+prometheus-client
+pytest
+respx
+uvicorn

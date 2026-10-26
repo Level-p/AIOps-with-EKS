@@ -1,0 +1,88 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>CareSignal Records</title>
+  <link rel="stylesheet" href="styles.css">
+  <script src="app.js" defer></script>
+</head>
+<body>
+  <header class="bar">
+    <div class="brand">CareSignal <span>patient records + clinical assistant</span></div>
+    <div class="who" id="who"></div>
+  </header>
+  <p class="banner">Synthetic data only. Not for clinical use. AI output is decision support and must be verified against the record.</p>
+
+  <section id="login" class="card narrow" hidden>
+    <h2>Sign in</h2>
+    <form id="login-form">
+      <label for="token">Clinician token</label>
+      <input id="token" type="password" autocomplete="off" required>
+      <button type="submit">Sign in</button>
+    </form>
+    <p class="hint">The token is kept in this browser tab only (sessionStorage).</p>
+  </section>
+
+  <main id="main" hidden>
+    <aside class="card" id="ward">
+      <div class="row">
+        <h2>Patients</h2>
+        <select id="ward-filter" aria-label="Ward"><option value="">All wards</option></select>
+      </div>
+      <ul id="patients" class="list"></ul>
+      <details>
+        <summary>Register a patient</summary>
+        <form id="new-patient" class="stack">
+          <input name="pseudonym" placeholder="Pseudonym, e.g. Bed 5 - P-2041" required maxlength="64">
+          <input name="ward" placeholder="Ward" required maxlength="32">
+          <select name="age_band"><option>18-39</option><option selected>40-64</option><option>65-79</option><option>80+</option><option>0-17</option></select>
+          <select name="sex"><option>female</option><option>male</option><option>other</option><option selected>unknown</option></select>
+          <button type="submit">Register</button>
+        </form>
+      </details>
+    </aside>
+
+    <section class="card" id="record">
+      <p class="hint" id="record-empty">Select a patient.</p>
+      <div id="record-body" hidden>
+        <div class="row"><h2 id="p-title"></h2><span id="p-risk" class="badge"></span></div>
+        <p id="p-meta" class="hint"></p>
+        <div class="grid">
+          <div><h3>Vital signs</h3><table><thead><tr><th>Time</th><th>HR</th><th>RR</th><th>SpO2</th><th>BP</th><th>Temp</th><th>NEWS2</th></tr></thead><tbody id="vitals"></tbody></table></div>
+          <div>
+            <h3>Medications</h3><ul id="meds" class="list small"></ul>
+            <h3>Allergies</h3><ul id="allergies" class="list small"></ul>
+            <h3>Problems</h3><ul id="problems" class="list small"></ul>
+          </div>
+        </div>
+        <h3>Notes</h3>
+        <form id="new-note" class="row">
+          <select name="kind"><option>progress</option><option>nursing</option><option>admission</option><option>handover</option></select>
+          <input name="body" placeholder="Add a note" required maxlength="8000">
+          <button type="submit">Add</button>
+        </form>
+        <ul id="notes" class="list notes"></ul>
+      </div>
+    </section>
+
+    <section class="card" id="assistant">
+      <h2>Clinical assistant</h2>
+      <p class="hint">Answers come only from this patient's record, with citations. Every use is audited.</p>
+      <div class="row wrap">
+        <button id="btn-summary" disabled>Summarise record</button>
+        <button id="btn-handover" disabled class="secondary">Draft handover</button>
+        <button id="btn-discharge" disabled class="secondary">Draft discharge summary</button>
+      </div>
+      <form id="ask" class="row">
+        <input id="question" placeholder="Ask about this patient's record" maxlength="500" disabled>
+        <button type="submit" disabled id="btn-ask">Ask</button>
+      </form>
+      <div id="ai-status" class="hint" role="status"></div>
+      <div id="ai-output"></div>
+      <h3>AI activity on this record</h3>
+      <ul id="ai-activity" class="list small"></ul>
+    </section>
+  </main>
+</body>
+</html>

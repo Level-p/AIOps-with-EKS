@@ -1,0 +1,126 @@
+# OWASP ZAP Automation Framework plan: FULL scan (passive + active) of an EPHEMERAL CareSignal
+# started inside the CI job (synthetic data, thrown away afterwards). Active scanning sends
+# attack payloads (SQL injection, XSS, path traversal, command injection...) and writes data,
+# so it never runs against a shared environment: stage gets dast/zap/stage-baseline.yaml.
+#
+# Inputs (environment variables):
+#   TARGET_URL       base URL, e.g. http://localhost:8080 (the gateway that mirrors the ingress)
+#   CLINICIAN_TOKEN  bearer token for /api/*            (authenticated scan)
+#   DEVICE_TOKEN     X-Device-Token for /v1/readings
+#   DAST_DIR         folder with openapi/ and reports/  (/zap/wrk/dast in the container)
+# Run: zap.sh -cmd -autorun /zap/wrk/dast/zap/ci-full.yaml
+env:
+  contexts:
+    - name: caresignal
+      urls: ["${TARGET_URL}"]
+      includePaths: ["${TARGET_URL}.*"]
+      excludePaths:
+        - ".*/healthz.*"
+        - ".*/readyz.*"
+  parameters:
+    failOnError: true        # a job that cannot run (spec not imported, target down) fails the build
+    failOnWarning: false
+    progressToStdout: true
+
+jobs:
+  # Authenticated scan: every request ZAP sends carries the credentials the real clients use.
+  # Without this ZAP only sees 401 responses and tests almost nothing.
+  - type: replacer
+    parameters:
+      deleteAllRules: true
+    rules:
+      - description: clinician bearer token
+        url: ".*/api/.*"
+        matchType: req_header
+        matchString: Authorization
+        matchRegex: false
+        replacementString: "Bearer ${CLINICIAN_TOKEN}"
+      - description: device token
+        url: ".*/v1/readings.*"
+        matchType: req_header
+        matchString: X-Device-Token
+        matchRegex: false
+        replacementString: "${DEVICE_TOKEN}"
+
+  # The API contract: every operation and parameter becomes a scan target
+  - type: openapi
+    parameters:
+      apiFile: "${DAST_DIR}/openapi/caresignal.generated.yaml"
+      targetUrl: "${TARGET_URL}"
+      context: caresignal
+
+  # The dashboard (HTML, JavaScript, CSS) is found by the spider
+  - type: spider
+    parameters:
+      context: caresignal
+      maxDuration: 2
+      maxDepth: 5
+
+  # Assertions about the edge: service-to-service routes must not be reachable from outside
+  - type: requestor
+    parameters:
+      user: ""
+    requests:
+      - url: "${TARGET_URL}/internal/readings"
+        method: POST
+        data: "{}"
+        responseCode: 404
+      - url: "${TARGET_URL}/internal/ai-interactions"
+        method: POST
+        data: "{}"
+        responseCode: 404
+
+  - type: passiveScan-wait
+    parameters:
+      maxDuration: 5
+
+  - type: activeScan
+    parameters:
+      context: caresignal
+      maxRuleDurationInMins: 3
+      maxScanDurationInMins: 25
+      threadPerHost: 4
+    policyDefinition:
+      defaultStrength: medium
+      defaultThreshold: medium
+      rules:
+        # The ephemeral app speaks plain HTTP on the agent; TLS is tested by the deployed baseline
+        - { id: 10106, name: HTTP Only Site, threshold: "off" }
+        # Not applicable to a Node.js/PostgreSQL API: skip to keep the scan inside its time box
+        - { id: 40019, name: SQL Injection - MySQL, threshold: "off" }
+        - { id: 40020, name: SQL Injection - Hypersonic SQL, threshold: "off" }
+        - { id: 40021, name: SQL Injection - Oracle, threshold: "off" }
+        - { id: 40024, name: SQL Injection - SQLite, threshold: "off" }
+        - { id: 40027, name: SQL Injection - MsSQL, threshold: "off" }
+        # Relevant to this stack: test harder
+        - { id: 40018, name: SQL Injection, strength: high }
+        - { id: 40022, name: SQL Injection - PostgreSQL, strength: high }
+        - { id: 40012, name: Cross Site Scripting (Reflected), strength: high }
+        - { id: 40014, name: Cross Site Scripting (Persistent), strength: high }
+        - { id: 90020, name: Remote OS Command Injection, strength: high }
+        - { id: 6, name: Path Traversal, strength: high }
+
+  - type: passiveScan-wait
+    parameters:
+      maxDuration: 5
+
+  # Reports: JSON for the gate (dast/zap_gate.py), SARIF for GitHub code scanning, HTML for people
+  - type: report
+    parameters:
+      template: traditional-json
+      reportDir: "${DAST_DIR}/reports"
+      reportFile: zap-report.json
+    risks: [info, low, medium, high]
+  - type: report
+    parameters:
+      template: sarif-json
+      reportDir: "${DAST_DIR}/reports"
+      reportFile: zap-report.sarif.json
+    risks: [low, medium, high]
+  - type: report
+    parameters:
+      template: traditional-html
+      reportDir: "${DAST_DIR}/reports"
+      reportFile: zap-report.html
+      reportTitle: CareSignal DAST (full scan, ephemeral environment)
+    risks: [info, low, medium, high]

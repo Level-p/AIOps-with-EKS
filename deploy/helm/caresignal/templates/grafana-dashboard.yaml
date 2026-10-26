@@ -1,0 +1,13 @@
+{{- if .Values.monitoring.grafanaDashboard }}
+# Loaded by the Grafana sidecar (kube-prometheus-stack watches ConfigMaps labelled grafana_dashboard=1)
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: caresignal-dashboard
+  labels:
+    {{- include "caresignal.labels" (dict "root" . "name" "caresignal-dashboard") | nindent 4 }}
+    grafana_dashboard: "1"
+data:
+  caresignal-overview.json: |-
+{{ .Files.Get "dashboards/caresignal-overview.json" | indent 4 }}
+{{- end }}

@@ -1,0 +1,45 @@
+# Supply-chain gate at deploy time: a CareSignal image runs only if it was signed by
+# THIS repository's build workflow on main (Sigstore keyless: GitHub OIDC identity,
+# Fulcio certificate, Rekor transparency log). An image pushed by hand, built on a
+# branch or in another repository is rejected. Tags are replaced by the verified digest.
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: verify-caresignal-image-signatures
+  annotations:
+    policies.kyverno.io/title: Verify CareSignal image signatures
+    policies.kyverno.io/category: Supply chain
+spec:
+  webhookTimeoutSeconds: 30
+  background: false
+  rules:
+    - name: signed-by-ci-on-main
+      match:
+        any:
+          - resources:
+              kinds: [Pod]
+              namespaces: [caresignal-stage, caresignal-prod, aiops]
+      verifyImages:
+        - imageReferences:
+            - "127214197057.dkr.ecr.eu-west-2.amazonaws.com/caresignal/*"
+          failureAction: Enforce
+          mutateDigest: true
+          verifyDigest: true
+          required: true
+          attestors:
+            - entries:
+                - keyless:
+                    issuer: https://token.actions.githubusercontent.com
+                    subjectRegExp: "^https://github\.com/Level-p/AIOps-with-EKS/\.github/workflows/app\.yml@refs/heads/main$"
+                    rekor:
+                      url: https://rekor.sigstore.dev
+          # The SBOM (CycloneDX) attached by the pipeline must exist and come from the same workflow
+          attestations:
+            - type: https://cyclonedx.org/bom
+              attestors:
+                - entries:
+                    - keyless:
+                        issuer: https://token.actions.githubusercontent.com
+                        subjectRegExp: "^https://github\.com/Level-p/AIOps-with-EKS/\.github/workflows/app\.yml@refs/heads/main$"
+                        rekor:
+                          url: https://rekor.sigstore.dev
