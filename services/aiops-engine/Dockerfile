@@ -1,12 +1,12 @@
 # CareSignal aiops-engine
 # Base image pinned by digest (Dependabot proposes updates); dependencies installed
 # with --require-hashes, so a tampered or substituted package fails the build.
-FROM python:3.12-slim@sha256:a6e34c598f2467ed0e9a8d349809fcd8b5c603269512df273a0bb1784edc11b1 AS build
+FROM python:3.12-slim@sha256:a0f57064cbdcd6285fa45f51237ab0b35ea8ebaed06a1f5973e89e19dfb86704 AS build
 WORKDIR /build
 COPY requirements.txt .
 RUN pip install --no-cache-dir --require-hashes --prefix=/install -r requirements.txt
 
-FROM python:3.12-slim@sha256:a6e34c598f2467ed0e9a8d349809fcd8b5c603269512df273a0bb1784edc11b1 AS runner
+FROM python:3.12-slim@sha256:a0f57064cbdcd6285fa45f51237ab0b35ea8ebaed06a1f5973e89e19dfb86704 AS runner
 ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 PYTHONPATH=/app
 RUN groupadd --gid 10001 app && useradd --uid 10001 --gid app --no-create-home --shell /usr/sbin/nologin app     && rm -rf /usr/local/lib/python3.12/site-packages/pip /usr/local/bin/pip*   # no installer at run time
 COPY --from=build /install /usr/local
