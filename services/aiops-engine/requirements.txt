@@ -32,9 +32,9 @@ docstring-parser==0.18.0 \
     --hash=sha256:292510982205c12b1248696f44959db3cdd1740237a968ea1e2e7a900eeb2015 \
     --hash=sha256:b3fcbed555c47d8479be0796ef7e19c2670d428d72e96da63f3a40122860374b
     # via anthropic
-fastapi==0.143.3 \
-    --hash=sha256:75e8bd68e2f52f77d29b2879749c257d64de2d85282d25270caf2bfccce5efe5 \
-    --hash=sha256:b9ab567ee57afb4454004ce04c889f8f0160ac47946b99795887cd6e88484848
+fastapi==0.162.2 \
+    --hash=sha256:9ebd2a69b579141315b2447d8e3f518e6fd909abd6c01cac5cc6b06d5c8841f4 \
+    --hash=sha256:d0584f9662317e01140df94c64f4bed1d8b059fe35496e30c9c92f70e6e5ff15
     # via -r requirements.in
 h11==0.16.0 \
     --hash=sha256:4e35b956cf45792e4caa5885e69fba00bdbc6ffafbfa020300e549b208ee5ff1 \
@@ -362,7 +362,6 @@ typing-extensions==4.16.0 \
     --hash=sha256:dc983d19a509c94dba722ee6abd33940f7c05a89e243c47e907eb4db6f1a43e5
     # via
     #   anthropic
-    #   anyio
     #   fastapi
     #   opentelemetry-api
     #   pydantic
